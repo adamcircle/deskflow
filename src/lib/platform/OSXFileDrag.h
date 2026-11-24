@@ -84,6 +84,12 @@ public:
    * parked local drag. That release must reach the system, where the catcher refuses the drop.
    */
   bool takeParkedRelease();
+  /**
+   * Event tap thread (server only): takes the jump that parking the local drag put into the
+   * mouse motion out of \p dx, \p dy. Moving the cursor adds the distance to the motion
+   * reported after it, which would otherwise count as the user moving back to this computer.
+   */
+  void removeParkJump(int32_t &dx, int32_t &dy);
   //@}
 
   //! A file drag message from the peer: acks, dropped, finished and cancels for drags sent

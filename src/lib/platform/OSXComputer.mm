@@ -1047,6 +1047,11 @@ bool OSXComputer::onMouseMove(CGEventRef event)
     int32_t dx = (int32_t)CGEventGetIntegerValueField(event, kCGMouseEventDeltaX);
     int32_t dy = (int32_t)CGEventGetIntegerValueField(event, kCGMouseEventDeltaY);
 
+    if (m_fileDrag) {
+      // file drag: parking the local drag moved the cursor, which is not motion of the user's
+      m_fileDrag->removeParkJump(dx, dy);
+    }
+
     LOG_VERBOSE("mouse delta %+d,%+d", dx, dy);
 
     if (dx != 0 || dy != 0) {

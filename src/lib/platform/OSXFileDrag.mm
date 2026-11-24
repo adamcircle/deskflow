@@ -257,6 +257,12 @@ struct OSXFileDrag::State : public std::enable_shared_from_this<OSXFileDrag::Sta
   std::atomic<bool> parkedRelease{false};
   //! the cursor is on the other computer with a drag handed off (core thread writes, main thread reads)
   std::atomic<bool> away{false};
+  //! parking the drag moved the cursor by parkJumpX, parkJumpY; the mouse motion after it
+  //! still contains that distance (main thread writes, event tap thread takes it)
+  std::atomic<bool> parkJumped{false};
+  std::mutex parkJumpMutex;
+  int32_t parkJumpX = 0;
+  int32_t parkJumpY = 0;
   //! the drag that is being handed off or sent (core thread writes, main thread reads)
   std::atomic<uint32_t> currentDragId{0};
 
@@ -1315,6 +1321,14 @@ void handOffMain(StatePtr s, uint32_t dragId, int32_t parkX, int32_t parkY)
   if (s->away) {
     // not when the cursor already came back: it stays where the user has it
     LOG_INFO("file drag %u: the local drag waits at %d,%d (the cursor crossed at %d,%d)", dragId, x, y, parkX, parkY);
+    if (s->primary) {
+      // before the move, so no motion with the jump in it is missed
+      const CGPoint from = currentCursor();
+      std::scoped_lock lock(s->parkJumpMutex);
+      s->parkJumpX = x - static_cast<int32_t>(std::lround(from.x));
+      s->parkJumpY = y - static_cast<int32_t>(std::lround(from.y));
+      s->parkJumped = s->parkJumpX != 0 || s->parkJumpY != 0;
+    }
     moveLocalDrag(CGPointMake(x, y));
   }
   ++s->stripGeneration;
@@ -1964,6 +1978,7 @@ void OSXFileDrag::takeBack()
   }
   m_state->parkedRelease = false;
   m_state->away = false;
+  m_state->parkJumped = false;
   if (const uint32_t id = m_state->currentDragId.exchange(0); id != 0) {
     LOG_INFO("file drag %u: cursor came back, stop sending", id);
     stopSourceSession(m_state, id);
@@ -1981,6 +1996,7 @@ void OSXFileDrag::entered()
   }
   m_state->parkedRelease = false;
   m_state->away = false;
+  m_state->parkJumped = false;
   StatePtr s = m_state;
   dispatchMain(^{
     unpark(s, "cursor is back");
@@ -1990,6 +2006,34 @@ void OSXFileDrag::entered()
 bool OSXFileDrag::takeParkedRelease()
 {
   return m_state->parkedRelease.exchange(false);
+}
+
+void OSXFileDrag::removeParkJump(int32_t &dx, int32_t &dy)
+{
+  if (!m_state->parkJumped) {
+    return;
+  }
+  std::scoped_lock lock(m_state->parkJumpMutex);
+  if (!m_state->parkJumped) {
+    return;
+  }
+  // the motion with the jump in it goes about as far as the jump, the same way (back towards
+  // this computer, which the user is leaving). Any other motion is the user's and stays
+  const int32_t jumpX = m_state->parkJumpX;
+  const int32_t jumpY = m_state->parkJumpY;
+  const bool alongX = std::abs(jumpX) >= std::abs(jumpY);
+  const int32_t jump = alongX ? jumpX : jumpY;
+  const int32_t moved = alongX ? dx : dy;
+  if ((moved < 0) != (jump < 0) || std::abs(moved) < std::abs(jump) / 2) {
+    return;
+  }
+  m_state->parkJumped = false;
+  LOG_INFO(
+      "file drag: motion %+d,%+d has the parked drag's move %+d,%+d in it, which is not the user's", dx, dy, jumpX,
+      jumpY
+  );
+  dx -= jumpX;
+  dy -= jumpY;
 }
 
 void OSXFileDrag::receive(const fd::Message &message)
