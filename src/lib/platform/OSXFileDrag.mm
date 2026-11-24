@@ -80,6 +80,11 @@ constexpr auto kStallTimeout = std::chrono::seconds(120);
 constexpr uint64_t kFinderProgressMinBytes = 50ull * 1024 * 1024;
 //! How often Finder progress is updated while bytes arrive (at most ~10 times per second)
 constexpr auto kProgressUpdateInterval = std::chrono::milliseconds(100);
+//! Most files whose Quick Look image is remembered
+constexpr size_t kThumbnailsKept = 64;
+//! After a press of the left button: how often to look whether a drag of files began, and how many times
+constexpr double kDragWatchSeconds = 0.05;
+constexpr int kDragWatchTries = 100;
 //! How often a parked drag that is not over the catcher yet is moved there again, and how many times
 //! How often a cancelled drag is moved over the refusing window again before it is let go there, and how many times
 constexpr double kRefuseRetrySeconds = 0.02;
@@ -181,7 +186,6 @@ struct Offer
   // main thread only: the picture of the drag made from its files (see makePicture())
   fd::Icon picture;
   FinderIconViewMetrics pictureMetrics;
-  QLThumbnailRepresentation *thumbnails[kPictureItems] = {}; ///< best so far for each shown item
   bool pictureMade = false;
   CFAbsoluteTime pictureStarted = 0;
 };
@@ -364,8 +368,18 @@ struct OSXFileDrag::State : public std::enable_shared_from_this<OSXFileDrag::Sta
 
   // main thread only
   std::shared_ptr<Offer> offer;
-  NSInteger previewSequence = -1; ///< the drag (its dragging sequence number) that preview shows
-  fd::Icon preview;               ///< what the drag at the edge window looks like; empty if unknown
+  //! the best Quick Look image so far of files that were dragged, by path: a drag that
+  //! crosses again, or is offered again, shows what was found before
+  struct Thumbnail
+  {
+    QLThumbnailRepresentation *image = nil;
+    NSDate *modified = nil; ///< of the file when it was asked for; a changed file is asked for again
+  };
+  std::map<std::string, Thumbnail> thumbnails;
+  uint64_t buttonGeneration = 0;    ///< counts presses of the left button (see watchForDrag())
+  NSInteger buttonChangeCount = -1; ///< change count of the drag pasteboard at the last press
+  NSInteger previewSequence = -1;   ///< the drag (its dragging sequence number) that preview shows
+  fd::Icon preview;                 ///< what the drag at the edge window looks like; empty if unknown
   bool overStrip = false;
   bool offered = false;
   bool parked = false;
@@ -1593,7 +1607,7 @@ FinderIconViewMetrics finderIconViewMetrics()
  * behind the other and the first item's name under them, with the cursor on the middle of the
  * front icon. Items whose thumbnail is not there yet show their plain icon.
  */
-void makePicture(const std::shared_ptr<Offer> &offer)
+void makePicture(StatePtr s, const std::shared_ptr<Offer> &offer)
 {
   if (offer->pictureMade || offer->paths.empty()) {
     return;
@@ -1609,7 +1623,8 @@ void makePicture(const std::shared_ptr<Offer> &offer)
   NSMutableArray<NSImage *> *images = [NSMutableArray array];
   size_t thumbnails = 0;
   for (size_t i = 0; i < shown; ++i) {
-    QLThumbnailRepresentation *have = offer->thumbnails[i];
+    const auto found = s->thumbnails.find(offer->paths[i].string());
+    QLThumbnailRepresentation *have = found != s->thumbnails.end() ? found->second.image : nil;
     if (have != nil) {
       [images addObject:have.NSImage];
       thumbnails += have.type != QLThumbnailRepresentationTypeIcon;
@@ -1699,16 +1714,40 @@ void makePicture(const std::shared_ptr<Offer> &offer)
   );
 }
 
-//! Asks for thumbnails of the first items of \p offer's drag, keeping the best until hand-off
-void requestThumbnails(std::shared_ptr<Offer> offer)
+//! When \p path was last changed, nil if that is not known
+NSDate *modifiedDate(const fs::path &path)
 {
-  offer->pictureMetrics = finderIconViewMetrics();
-  const CGFloat side = offer->pictureMetrics.iconSize;
-  const size_t shown = std::min(offer->paths.size(), kPictureItems);
-  std::weak_ptr<Offer> weak = offer;
-  offer->pictureStarted = CFAbsoluteTimeGetCurrent();
+  NSDictionary *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:toNSString(path.string())
+                                                                              error:nil];
+  return attributes.fileModificationDate;
+}
+
+/**
+ * Asks Quick Look for images of the first \p paths, at the sizes of Finder's icon view, and
+ * keeps the best that comes for each (its icon comes first, a thumbnail later, if it has
+ * one) in State::thumbnails. What is there already is not asked for again.
+ */
+void warmThumbnails(StatePtr s, const std::vector<fs::path> &paths)
+{
+  const CGFloat side = finderIconViewMetrics().iconSize;
+  const size_t shown = std::min(paths.size(), kPictureItems);
+  WeakState weak = s;
   for (size_t i = 0; i < shown; ++i) {
-    NSURL *url = [NSURL fileURLWithPath:toNSString(offer->paths[i].string())];
+    const std::string key = paths[i].string();
+    NSDate *modified = modifiedDate(paths[i]);
+    if (auto it = s->thumbnails.find(key); it != s->thumbnails.end()) {
+      const bool same = modified != nil && it->second.modified != nil && [modified isEqualToDate:it->second.modified];
+      if (same) {
+        continue; // asked for already; its results come to the same place
+      }
+      s->thumbnails.erase(it);
+    }
+    if (s->thumbnails.size() >= kThumbnailsKept) {
+      s->thumbnails.clear();
+    }
+    s->thumbnails[key].modified = modified;
+
+    NSURL *url = [NSURL fileURLWithPath:toNSString(key)];
     QLThumbnailGenerationRequest *request =
         [[QLThumbnailGenerationRequest alloc] initWithFileAtURL:url
                                                            size:CGSizeMake(side, side)
@@ -1728,16 +1767,22 @@ void requestThumbnails(std::shared_ptr<Offer> offer)
                                 return;
                               }
                               dispatchMain(^{
-                                auto current = weak.lock();
-                                if (!current) {
+                                auto state = weak.lock();
+                                if (!state) {
                                   return;
                                 }
-                                auto previous = current->thumbnails[i];
-                                if (previous == nil || thumbnail.type > previous.type) {
-                                  current->thumbnails[i] = thumbnail;
-                                  // a picture already sent stays as it is; the next time
-                                  // this drag crosses, it is made again with this one
-                                  current->pictureMade = false;
+                                auto it = state->thumbnails.find(key);
+                                if (it == state->thumbnails.end() || it->second.modified != modified) {
+                                  return; // forgotten, or asked for again since
+                                }
+                                if (it->second.image != nil && thumbnail.type <= it->second.image.type) {
+                                  return; // never a worse one
+                                }
+                                it->second.image = thumbnail;
+                                // a picture already sent stays as it is; the next time the
+                                // drag crosses, it is made again with this one
+                                if (state->offer) {
+                                  state->offer->pictureMade = false;
                                 }
                               });
                             }];
@@ -1759,7 +1804,9 @@ void prepareOffer(StatePtr s, std::vector<fs::path> paths, NSInteger changeCount
   offer->changeCount = changeCount;
   s->offer = offer;
   // not waited for: the offer is ready when its list is, the picture when the hand-off comes
-  requestThumbnails(offer);
+  offer->pictureMetrics = finderIconViewMetrics();
+  offer->pictureStarted = CFAbsoluteTimeGetCurrent();
+  warmThumbnails(s, offer->paths);
   const uint64_t generation = ++s->scanGeneration;
   const CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
   WeakState weak = s;
@@ -1813,6 +1860,31 @@ void onFilesEntered(StatePtr s, std::vector<fs::path> paths, id<NSDraggingInfo> 
       );
     }
   }
+}
+
+/**
+ * The left button went down \p tries looks ago: if a drag of files has begun since, ask for
+ * the images of its files now. They take some tens of milliseconds, and a drag that is flung
+ * at the edge got there before them, so the other computer showed plain icons.
+ */
+void watchForDrag(StatePtr s, uint64_t generation, int tries)
+{
+  if (generation != s->buttonGeneration || tries >= kDragWatchTries ||
+      !CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonLeft)) {
+    return;
+  }
+  NSPasteboard *pasteboard = [NSPasteboard pasteboardWithName:NSPasteboardNameDrag];
+  if (pasteboard.changeCount != s->buttonChangeCount) {
+    const auto paths = filePathsOnPasteboard(pasteboard);
+    if (!paths.empty()) {
+      LOG_INFO("file drag: a drag of %zu items began, asking for their pictures", paths.size());
+      warmThumbnails(s, paths);
+    }
+    return;
+  }
+  dispatchMainAfter(kDragWatchSeconds, ^{
+    watchForDrag(s, generation, tries + 1);
+  });
 }
 
 /**
@@ -2093,7 +2165,7 @@ void handOffMain(StatePtr s, uint32_t dragId, int32_t parkX, int32_t parkY)
     shows = &s->preview;
     what = "the drag as it looks here";
   } else if (s->peerPreview) {
-    makePicture(s->offer); // with the thumbnails that are there by now
+    makePicture(s, s->offer); // with the thumbnails that are there by now
     if (!offer.picture.isEmpty()) {
       shows = &offer.picture;
       what = "a picture made from the files";
@@ -2859,6 +2931,21 @@ void OSXFileDrag::entered()
 bool OSXFileDrag::takeParkedRelease()
 {
   return m_state->parkedRelease.exchange(false);
+}
+
+void OSXFileDrag::leftButtonDown()
+{
+  if (!m_state->available) {
+    return;
+  }
+  StatePtr s = m_state;
+  dispatchMain(^{
+    const uint64_t generation = ++s->buttonGeneration;
+    s->buttonChangeCount = [NSPasteboard pasteboardWithName:NSPasteboardNameDrag].changeCount;
+    dispatchMainAfter(kDragWatchSeconds, ^{
+      watchForDrag(s, generation, 0);
+    });
+  });
 }
 
 bool OSXFileDrag::parkedDragIsCaught() const

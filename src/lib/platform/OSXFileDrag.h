@@ -80,6 +80,8 @@ public:
   void takeBack();
   //! The cursor is back on this computer: nothing stays parked
   void entered();
+  //! Any thread: the left button went down on this computer; a drag of files may begin
+  void leftButtonDown();
   /**
    * Event tap thread (server only): true (once) for the left button release that ends the
    * parked local drag. That release must reach the system, where the catcher refuses the drop.

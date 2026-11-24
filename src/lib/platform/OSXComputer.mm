@@ -606,6 +606,9 @@ void OSXComputer::fakeMouseButton(ButtonID id, bool press)
 
   m_buttonState.set(index, state);
   CGEventPost(kCGHIDEventTap, event);
+  if (press && id == kButtonLeft && m_fileDrag) {
+    m_fileDrag->leftButtonDown();
+  }
 
   CFRelease(event);
 
@@ -1077,6 +1080,9 @@ bool OSXComputer::onMouseButton(bool pressed, uint16_t macButton)
 
   if (pressed) {
     LOG_VERBOSE("event: button press button=%d", button);
+    if (button == kButtonLeft && m_isOnComputer && m_fileDrag) {
+      m_fileDrag->leftButtonDown();
+    }
     if (button != kButtonNone) {
       KeyModifierMask mask = m_keyState->getActiveModifiers();
       sendEvent(EventTypes::PrimaryComputerButtonDown, ButtonInfo::alloc(button, mask));
