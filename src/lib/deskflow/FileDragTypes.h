@@ -41,7 +41,19 @@ enum Capability : uint32_t
   /// Understands the client to server messages (kMsgDFileDragWatch, kMsgDFileDragOffer,
   /// kMsgDFileDragHandOff). Peers built before them never set it, so they never get them.
   kCapReverse = 1u << 2,
+  /// Sends no file data before the drop. As a destination: says kMsgDFileDragDropped as soon
+  /// as the drop target asks for the files, and waits for them from then on. As a source:
+  /// keeps the files back until that message when the destination set this flag too, so a
+  /// drag that is cancelled or goes back never copies anything. Peers without it get the
+  /// files from the hand-off on, as before.
+  kCapLazy = 1u << 3,
 };
+
+//! True if a source with \p sourceCaps keeps its files back until the drop on a destination with \p destinationCaps
+constexpr bool lazyTransferAvailable(uint32_t sourceCaps, uint32_t destinationCaps)
+{
+  return (sourceCaps & kCapLazy) != 0 && (destinationCaps & kCapLazy) != 0;
+}
 
 //! True if the server (with \p serverCaps) may take file drags from a client with \p clientCaps
 constexpr bool reverseDragAvailable(uint32_t serverCaps, uint32_t clientCaps)

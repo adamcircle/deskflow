@@ -379,6 +379,8 @@ private:
   // server: m_fileDragSource is the client the files come from, the target is the server.
   void handleFileDragEvent(const Event &event);
   void fileDragUpdateRemoteWatch(int32_t x, int32_t y);
+  //! How long the held button has kept the cursor at an edge, in ms; starts the count afresh
+  double fileDragEdgeWaitMs();
   void fileDragStopRemoteWatch(const char *why);
   void fileDragRemoteOffer(BaseClientProxy *client, bool ready);
   bool fileDragFromClient(BaseClientProxy *client, const deskflow::filedrag::Message &message);
@@ -514,6 +516,9 @@ private:
   uint32_t m_fileDragWatchedSides = 0;
   //! Arch::time() of the last hand-off; the cursor may not take the drag back right after it
   double m_fileDragHandOffTime = 0.0;
+  //! Arch::time() when the held button first kept the cursor at an edge (0: it has not);
+  //! the hand-off logs how long the cursor waited there
+  double m_fileDragEdgeWaitStart = 0.0;
   // the "held button keeps the cursor here" reason was logged for this press
   bool m_fileDragLockExplained = false;
   EventQueueTimer *m_fileDragTimer = nullptr;

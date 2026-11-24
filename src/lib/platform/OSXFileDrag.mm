@@ -116,6 +116,7 @@ struct Offer
   std::vector<fs::path> sources;
   fd::Icon icon;
   bool ready = false;
+  double scanMs = 0; ///< how long building the item list and the icon took
 };
 
 //! Streams the files of one drag on its own thread (primary)
@@ -126,6 +127,7 @@ public:
 
   SourceSession(uint32_t dragId, const Offer &offer, const Send &send)
       : m_dragId(dragId),
+        m_items(offer.items.size()),
         m_send(send),
         m_sender(dragId, offer.items, offer.sources, send)
   {
@@ -142,9 +144,16 @@ public:
   SourceSession(const SourceSession &) = delete;
   SourceSession &operator=(const SourceSession &) = delete;
 
-  void start()
+  //! Starts sending; false if it already was (or was stopped first)
+  bool start()
   {
+    std::scoped_lock lock(m_mutex);
+    if (m_started || m_stopping) {
+      return false;
+    }
+    m_started = true;
     m_thread = std::thread([this] { run(); });
+    return true;
   }
 
   void onAck(uint32_t seq)
@@ -168,6 +177,11 @@ public:
   bool isDone() const
   {
     return m_done;
+  }
+
+  size_t itemCount() const
+  {
+    return m_items;
   }
 
 private:
@@ -202,12 +216,14 @@ private:
   }
 
   uint32_t m_dragId;
+  size_t m_items;
   Send m_send;
   fd::FileDragSender m_sender;
   std::thread m_thread;
   std::mutex m_mutex;
   std::condition_variable m_cond;
   std::deque<uint32_t> m_acks;
+  bool m_started = false;
   bool m_stopping = false;
   std::atomic<bool> m_done{false};
 };
@@ -230,7 +246,9 @@ struct DestSession
   std::atomic<bool> told{false}; ///< the server knows how it ended
   std::atomic<bool> finished{false};
   std::atomic<bool> promiseAsked{false};
-  int promisesLeft = 0; ///< main thread only
+  std::atomic<bool> droppedSent{false}; ///< the source was told to send the files
+  CFAbsoluteTime begunAt = 0;           ///< when the item list arrived (timing in the log)
+  int promisesLeft = 0;                 ///< main thread only
 };
 
 using DestPtr = std::shared_ptr<DestSession>;
@@ -257,6 +275,9 @@ struct OSXFileDrag::State : public std::enable_shared_from_this<OSXFileDrag::Sta
   std::atomic<bool> parkedRelease{false};
   //! the cursor is on the other computer with a drag handed off (core thread writes, main thread reads)
   std::atomic<bool> away{false};
+  //! the computer the next drag goes to waits for the files until the drop (kCapLazy; core
+  //! thread writes before each hand-off, main thread reads)
+  std::atomic<bool> peerLazy{false};
   //! parking the drag moved the cursor by parkJumpX, parkJumpY; the mouse motion after it
   //! still contains that distance (main thread writes, event tap thread takes it)
   std::atomic<bool> parkJumped{false};
@@ -281,6 +302,9 @@ struct OSXFileDrag::State : public std::enable_shared_from_this<OSXFileDrag::Sta
   unsigned watchEntered = 0;   ///< drags that reached an edge window during this watch
   unsigned watchUpdated = 0;   ///< draggingUpdated calls on an edge window during this watch
   bool catcherEntered = false; ///< the parked drag reached the catcher
+  //! change count of the drag pasteboard last read ahead of the drag reaching an edge window
+  NSInteger prebuiltChangeCount = -1;
+  CFAbsoluteTime edgeReachedAt = 0; ///< when the files reached an edge window (timing in the log)
 
   // secondary (destination) --------------------------------------------------------
   std::mutex destMutex;
@@ -1119,7 +1143,11 @@ void offerReady(StatePtr s)
 {
   if (!s->offered) {
     s->offered = true;
-    LOG_INFO("file drag offer ready (%zu items)", s->offer ? s->offer->items.size() : size_t{0});
+    LOG_INFO(
+        "file drag offer ready (%zu items, %.0f ms after they reached the edge window; the list took %.0f ms)",
+        s->offer ? s->offer->items.size() : size_t{0}, (CFAbsoluteTimeGetCurrent() - s->edgeReachedAt) * 1000.0,
+        s->offer ? s->offer->scanMs : 0.0
+    );
     s->postEvent(new fd::FileDragEvent(fd::FileDragEvent::Kind::OfferReady));
   }
 }
@@ -1132,12 +1160,11 @@ void offerLost(StatePtr s)
   }
 }
 
-//! A drag of files reached an edge window: build its item list (on a worker thread)
-void onFilesEntered(StatePtr s, std::vector<fs::path> paths, NSInteger changeCount)
+//! Builds the item list of a drag of \p paths (on a worker thread) unless it is this drag's already
+void prepareOffer(StatePtr s, std::vector<fs::path> paths, NSInteger changeCount)
 {
-  s->overStrip = true;
   if (s->offer && s->offer->changeCount == changeCount && s->offer->paths == paths) {
-    if (s->offer->ready) {
+    if (s->offer->ready && s->overStrip) {
       offerReady(s);
     }
     return; // the same drag; still scanning
@@ -1148,6 +1175,7 @@ void onFilesEntered(StatePtr s, std::vector<fs::path> paths, NSInteger changeCou
   offer->changeCount = changeCount;
   s->offer = offer;
   const uint64_t generation = ++s->scanGeneration;
+  const CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
   WeakState weak = s;
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
     auto scanned = std::make_shared<Offer>();
@@ -1166,12 +1194,43 @@ void onFilesEntered(StatePtr s, std::vector<fs::path> paths, NSInteger changeCou
       offer->items = std::move(scanned->items);
       offer->sources = std::move(scanned->sources);
       offer->icon = offer->paths.empty() ? fd::Icon{} : iconForPath(offer->paths.front());
+      offer->scanMs = (CFAbsoluteTimeGetCurrent() - started) * 1000.0;
       offer->ready = true;
       if (state->overStrip) {
         offerReady(state);
       }
     });
   });
+}
+
+//! A drag of files reached an edge window: offer them as soon as their item list is built
+void onFilesEntered(StatePtr s, std::vector<fs::path> paths, NSInteger changeCount)
+{
+  s->overStrip = true;
+  s->edgeReachedAt = CFAbsoluteTimeGetCurrent();
+  prepareOffer(s, std::move(paths), changeCount);
+}
+
+/**
+ * The edge windows just went up for a held button: if a drag of files is running, build its
+ * item list now, while the cursor is still on its way to the edge. The offer is then ready
+ * when the drag gets there and the cursor does not wait at the edge. The drag pasteboard
+ * keeps what the last drag left on it, so each of its contents is read ahead once only; the
+ * files are offered only when a drag really reaches an edge window with them.
+ */
+void prepareOfferAhead(StatePtr s)
+{
+  NSPasteboard *pasteboard = [NSPasteboard pasteboardWithName:NSPasteboardNameDrag];
+  const NSInteger changeCount = pasteboard.changeCount;
+  if (changeCount == s->prebuiltChangeCount) {
+    return;
+  }
+  s->prebuiltChangeCount = changeCount;
+  auto paths = filePathsOnPasteboard(pasteboard);
+  if (!paths.empty()) {
+    LOG_DEBUG("file drag: reading %zu dragged items ahead of the edge", paths.size());
+    prepareOffer(s, std::move(paths), changeCount);
+  }
 }
 
 //! What a watch that ended saw, so a drag that never reached the edge windows shows in the log
@@ -1220,6 +1279,7 @@ void watchEdgesMain(StatePtr s, uint32_t sides, const fd::EdgeRect &desktop)
     s->watching = true;
     s->watchEntered = 0;
     s->watchUpdated = 0;
+    prepareOfferAhead(s);
   }
   const CGPoint cursor = currentCursor();
   LOG_INFO(
@@ -1360,7 +1420,12 @@ void handOffMain(StatePtr s, uint32_t dragId, int32_t parkX, int32_t parkY)
   }
 
   const Offer &offer = *s->offer;
-  LOG_INFO("file drag %u: sending %zu items", dragId, offer.items.size());
+  const bool lazy = s->peerLazy;
+  if (lazy) {
+    LOG_INFO("file drag %u: showing %zu items there; nothing is sent before the drop", dragId, offer.items.size());
+  } else {
+    LOG_INFO("file drag %u: sending %zu items", dragId, offer.items.size());
+  }
   if (!offer.icon.isEmpty()) {
     fd::Message icon;
     icon.type = fd::Message::Type::Icon;
@@ -1390,7 +1455,10 @@ void handOffMain(StatePtr s, uint32_t dragId, int32_t parkX, int32_t parkY)
     std::scoped_lock lock(s->sessionsMutex);
     s->sessions[dragId] = std::move(session);
   }
-  raw->start();
+  if (!lazy) {
+    // a destination that cannot wait for the files gets them from now on
+    raw->start();
+  }
   // the next drag scans afresh (the files may change in between)
   s->offer.reset();
 }
@@ -1607,7 +1675,10 @@ void startDrag(StatePtr s, DestPtr session, NSView *view, NSEvent *event)
   }
   drag.animatesToStartingPositionsOnCancelOrFail = NO;
   drag.draggingFormation = NSDraggingFormationPile;
-  LOG_INFO("file drag %u: the drag runs (%lu items)", session->id, static_cast<unsigned long>(items.count));
+  LOG_INFO(
+      "file drag %u: the drag runs (%lu items, %.0f ms after they were announced)", session->id,
+      static_cast<unsigned long>(items.count), (CFAbsoluteTimeGetCurrent() - session->begunAt) * 1000.0
+  );
 }
 
 void loopEnded(StatePtr s, NSDragOperation operation)
@@ -1621,7 +1692,9 @@ void loopEnded(StatePtr s, NSDragOperation operation)
   if (dropped) {
     LOG_INFO("file drag %u dropped", session->id);
     session->phase = DestPhase::Dropped;
-    s->sendPeer(fd::Message::dropped(session->id));
+    if (!session->droppedSent.exchange(true)) {
+      s->sendPeer(fd::Message::dropped(session->id));
+    }
     if (session->promisesLeft <= 0) {
       finishSession(s, session);
     } else {
@@ -1661,6 +1734,10 @@ void writePromise(StatePtr s, uint32_t dragId, uint32_t index, NSURL *url, void 
   session->promiseAsked = true;
   const auto &entry = session->staging.entries()[index];
   LOG_INFO("file drag %u: the drop target asks for \"%s\"", dragId, entry.localPath.c_str());
+  if (!session->droppedSent.exchange(true)) {
+    // a source that keeps the files back until the drop (kCapLazy) sends them from now on
+    s->sendPeer(fd::Message::dropped(session->id));
+  }
 
   // the data may still be on its way: wait for every byte of this item
   using WaitResult = fd::FileDragStaging::WaitResult;
@@ -1722,6 +1799,7 @@ void beginSession(StatePtr s, const fd::Message &message)
 {
   auto session = std::make_shared<DestSession>(fd::FileDragStaging::defaultRoot());
   session->id = message.dragId;
+  session->begunAt = CFAbsoluteTimeGetCurrent();
   {
     std::scoped_lock lock(s->destMutex);
     if (s->pendingIconId == message.dragId) {
@@ -1945,7 +2023,7 @@ uint32_t OSXFileDrag::capabilities() const
     return fd::kCapNone;
   }
   // both roles, and the client to server messages (kMsgDFileDragWatch, Offer, HandOff)
-  return fd::kCapSource | fd::kCapDestination | fd::kCapReverse;
+  return fd::kCapSource | fd::kCapDestination | fd::kCapReverse | fd::kCapLazy;
 }
 
 void OSXFileDrag::watchEdges(uint32_t sideMask, int32_t x, int32_t y, int32_t w, int32_t h)
@@ -2060,9 +2138,20 @@ void OSXFileDrag::receive(const fd::Message &message)
     }
     return;
   }
-  case Dropped:
-    LOG_DEBUG("file drag %u dropped on the other computer", message.dragId);
+  case Caps:
+    // not from the wire: the flags of the computer the next drag goes to (see handOff())
+    s->peerLazy = fd::lazyTransferAvailable(capabilities(), message.flags);
     return;
+  case Dropped: {
+    // a destination that waits for the files (kCapLazy) asks for them with this
+    std::scoped_lock lock(s->sessionsMutex);
+    if (auto it = s->sessions.find(message.dragId); it != s->sessions.end() && it->second->start()) {
+      LOG_INFO(
+          "file drag %u: dropped on the other computer, sending %zu items now", message.dragId, it->second->itemCount()
+      );
+    }
+    return;
+  }
   case Finished:
     stopSourceSession(s, message.dragId);
     return;

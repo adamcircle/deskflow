@@ -52,6 +52,12 @@ public:
   bool onGrabClipboard(ClipboardID);
   void onClipboardChanged(ClipboardID, const IClipboard *);
 
+  //! The file drag capability flags the server advertised (deskflow::filedrag::Capability)
+  virtual uint32_t fileDragPeerCapabilities() const
+  {
+    return 0;
+  }
+
   //! Sends a file drag message to the server (only protocol 1.9 and later do anything)
   virtual void fileDragSend(const deskflow::filedrag::Message &)
   {

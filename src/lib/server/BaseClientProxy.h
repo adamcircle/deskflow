@@ -96,6 +96,12 @@ public:
     return false;
   }
 
+  //! The file drag capability flags this client advertised (deskflow::filedrag::Capability)
+  virtual uint32_t fileDragPeerCapabilities() const
+  {
+    return 0;
+  }
+
   //! Sends a file drag message to this client (ignored if not available)
   virtual void fileDragSend(const deskflow::filedrag::Message &)
   {

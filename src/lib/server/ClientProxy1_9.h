@@ -25,6 +25,10 @@ public:
 
   bool fileDragAvailable() const override;
   bool fileDragReverseAvailable() const override;
+  uint32_t fileDragPeerCapabilities() const override
+  {
+    return m_peerCaps;
+  }
   void fileDragSend(const deskflow::filedrag::Message &message) override;
 
 protected:

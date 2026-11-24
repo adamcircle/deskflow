@@ -22,6 +22,10 @@ public:
   ~ServerProxy1_9() override = default;
 
   void fileDragSend(const deskflow::filedrag::Message &message) override;
+  uint32_t fileDragPeerCapabilities() const override
+  {
+    return m_peerCaps;
+  }
 
 protected:
   ConnectionResult parseHandshakeMessage(const uint8_t *code) override;

@@ -546,6 +546,15 @@ void FileDragTests::reverseNeedsBothPeersNew()
   QFETCH(uint, client);
   QFETCH(bool, available);
   QCOMPARE(reverseDragAvailable(server, client), available);
+
+  // files wait for the drop only between two peers that both say they can; every older
+  // peer (and Windows) gets them from the hand-off on
+  const uint lazy = kCapSource | kCapDestination | kCapReverse | kCapLazy;
+  QVERIFY(lazyTransferAvailable(lazy, lazy));
+  QVERIFY(!lazyTransferAvailable(lazy, server & ~uint(kCapLazy)));
+  QVERIFY(!lazyTransferAvailable(client & ~uint(kCapLazy), lazy));
+  // the new flag changes nothing about which way files can be dragged
+  QCOMPARE(reverseDragAvailable(server | kCapLazy, client | kCapLazy), available);
 }
 
 void FileDragTests::localTransportRoundTrip()

@@ -878,6 +878,9 @@ bool Server::isSwitchOkay(
       LOG_INFO("file drag: the held button may cross to \"%s\"", getName(newComputer).c_str());
     } else {
       fileDragExplainLock(newComputer);
+      if (m_fileDragEdgeWaitStart == 0.0) {
+        m_fileDragEdgeWaitStart = Arch::time();
+      }
       LOG_VERBOSE("locked to computer");
       preventSwitch = true;
       stopSwitch();
@@ -1626,6 +1629,7 @@ void Server::onMouseDown(ButtonID id)
   }
   if (id == kButtonLeft) {
     m_fileDragLockExplained = false;
+    m_fileDragEdgeWaitStart = 0.0;
   }
 
   // relay
@@ -2134,6 +2138,13 @@ uint32_t Server::fileDragLocalCapabilities() const
   return m_primaryClient != nullptr ? m_primaryClient->fileDragCapabilities() : deskflow::filedrag::kCapNone;
 }
 
+double Server::fileDragEdgeWaitMs()
+{
+  const double waited = m_fileDragEdgeWaitStart != 0.0 ? (Arch::time() - m_fileDragEdgeWaitStart) * 1000.0 : 0.0;
+  m_fileDragEdgeWaitStart = 0.0;
+  return waited;
+}
+
 bool Server::isOnlyLeftButtonDown() const
 {
   return deskflow::filedrag::onlyLeftButtonDown(m_buttonsDown);
@@ -2249,7 +2260,10 @@ void Server::fileDragBeforeSwitch(BaseClientProxy *dst)
         m_fileDragTarget = m_primaryClient;
         m_fileDragPhase = FileDragPhase::Remote;
         m_fileDragHandOffTime = Arch::time();
-        LOG_INFO("file drag %u: carrying files from \"%s\" to this computer", m_fileDragId, getName(source).c_str());
+        LOG_INFO(
+            "file drag %u: carrying files from \"%s\" to this computer (the cursor waited %.0f ms at the edge)",
+            m_fileDragId, getName(source).c_str(), fileDragEdgeWaitMs()
+        );
         // the client parks its drag where its cursor will wait, then sends the items
         source->fileDragSend(Message::handOff(m_fileDragId));
       } else {
@@ -2293,7 +2307,14 @@ void Server::fileDragBeforeSwitch(BaseClientProxy *dst)
       m_fileDragPhase = FileDragPhase::Remote;
       m_fileDragHandOffTime = Arch::time();
       fileDragStopWatch();
-      LOG_INFO("file drag %u: carrying files to \"%s\"", m_fileDragId, getName(dst).c_str());
+      LOG_INFO(
+          "file drag %u: carrying files to \"%s\" (the cursor waited %.0f ms at the edge)", m_fileDragId,
+          getName(dst).c_str(), fileDragEdgeWaitMs()
+      );
+      if ((fileDragLocalCapabilities() & deskflow::filedrag::kCapLazy) != 0) {
+        // the platform keeps the files back until the drop if this client can wait for them
+        m_primaryClient->fileDragReceive(Message::caps(dst->fileDragPeerCapabilities()));
+      }
       m_primaryClient->fileDragHandOff(m_fileDragId);
     } else {
       fileDragEnd("switched without the drag");

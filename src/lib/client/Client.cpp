@@ -821,6 +821,8 @@ uint32_t Client::fileDragCapabilities() const
     // files can also be dragged from here to the server
     caps |= kCapSource | kCapReverse;
   }
+  // how the files travel is the platform's business
+  caps |= platform & kCapLazy;
   return caps;
 }
 
@@ -850,6 +852,10 @@ void Client::fileDragHandOff(uint32_t dragId)
   }
   LOG_INFO("file drag %u: the cursor takes the files to the server; parking the drag here and sending them", dragId);
   m_fileDragOutId = dragId;
+  if ((m_computer->fileDragCapabilities() & deskflow::filedrag::kCapLazy) != 0) {
+    // the platform keeps the files back until the drop if the server can wait for them
+    m_computer->fileDragReceive(Message::caps(m_server->fileDragPeerCapabilities()));
+  }
   // parks the local drag where the cursor waits while it is away, then sends the items
   m_computer->fileDragHandOff(dragId);
 }
