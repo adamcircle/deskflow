@@ -468,4 +468,7 @@ private:
   bool m_defaultLockToComputerState = false;
   bool m_disableLockToComputer = false;
   bool m_enableClipboard = true;
+
+  // last app reported as holding macOS Secure Input, to avoid repeat notifications
+  std::string m_lastSecureInputApp;
 };

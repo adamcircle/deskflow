@@ -34,4 +34,13 @@ void ServerProxy1_7::secureInputNotification() const
   std::string app;
   ProtocolUtil::readf(getStream(), kMsgDSecureInputNotification + 4, &app);
   LOG_INFO("application \"%s\" is blocking the keyboard", app.c_str());
+#if defined(__APPLE__)
+  // the gui watches the core output for this line and shows it as a notification
+  LOG_PRINT(
+      "OSX Notification: Keyboard blocked on the server|"
+      "Secure Input is on in \"%s\" on the server, so its keys can't reach this computer. "
+      "Close that app's password field to fix it.",
+      app.c_str()
+  );
+#endif
 }

@@ -214,6 +214,15 @@ std::string PrimaryClient::getSecureInputApp() const
 void PrimaryClient::secureInputNotification(const std::string &app) const
 {
   LOG_INFO("application \"%s\" is blocking the keyboard", app.c_str());
+#if defined(__APPLE__)
+  // the gui watches the core output for this line and shows it as a notification
+  LOG_PRINT(
+      "OSX Notification: Keyboard blocked|"
+      "Secure Input is on in \"%s\", so keys can't reach other computers. "
+      "Close that app's password field to fix it.",
+      app.c_str()
+  );
+#endif
 }
 
 void PrimaryClient::resetOptions()

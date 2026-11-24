@@ -474,7 +474,10 @@ void Server::switchComputer(BaseClientProxy *dst, int32_t x, int32_t y, bool for
 #if defined(__APPLE__)
     if (dst != m_primaryClient) {
       std::string secureInputApplication = m_primaryClient->getSecureInputApp();
-      if (secureInputApplication != "") {
+      // only notify when the blocking app changes, not on every switch
+      const bool notify = !secureInputApplication.empty() && secureInputApplication != m_lastSecureInputApp;
+      m_lastSecureInputApp = secureInputApplication;
+      if (notify) {
         // display notification on the server
         m_primaryClient->secureInputNotification(secureInputApplication);
         // display notification on the client
