@@ -73,6 +73,13 @@ int main(int argc, char **argv)
   ArchMiscWindows::setInstanceWin32(GetModuleHandle(nullptr));
 #endif
 
+#if defined(Q_OS_MACOS)
+  // Qt asks macOS to activate every app it starts. The core is a background process, so the
+  // request waits until its first window shows, which is a file drag window: the core then
+  // came to the front in the middle of a drag and took the focus from the user's app.
+  qputenv("QT_MAC_DISABLE_FOREGROUND_APPLICATION_TRANSFORM", "1");
+#endif
+
   QApplication::setApplicationName(QStringLiteral("%1 Core").arg(kAppName));
   QApplication app(argc, argv);
 

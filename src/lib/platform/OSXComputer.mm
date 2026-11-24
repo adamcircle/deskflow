@@ -79,6 +79,7 @@ std::string getProcessName(int pid);
 void setZeroSuppressionInterval();
 void avoidSupression();
 void logCursorVisibility();
+void hideCursorAgain(CGDirectDisplayID display);
 void avoidHesitatingCursor();
 
 //
@@ -1912,6 +1913,12 @@ void OSXComputer::fileDragReceive(const deskflow::filedrag::Message &message)
       fileDragReleaseParked(deskflow::filedrag::messageTypeName(message.type));
     }
   }
+  if (m_isPrimary && !m_isOnComputer && m_cursorHidden &&
+      (message.type == Type::Dropped || message.type == Type::Finished || message.type == Type::Cancel)) {
+    // a drag sent from here is over: the local drag parked here ends too, and the app it came
+    // from can show the cursor that leave() hid while the cursor is still on the other computer
+    hideCursorAgain(m_displayID);
+  }
   if (m_fileDrag) {
     m_fileDrag->receive(message);
   }
@@ -2194,6 +2201,17 @@ void logCursorVisibility()
   if (!CGCursorIsVisible()) {
     LOG_WARN("cursor may not be visible");
   }
+}
+
+void hideCursorAgain(CGDirectDisplayID display)
+{
+  if (!CGCursorIsVisible()) {
+    return;
+  }
+  LOG_INFO("the cursor shows while it is on another computer, hiding it again");
+  // show first: hide and show calls are counted, and enter() shows once
+  CGDisplayShowCursor(display);
+  CGDisplayHideCursor(display);
 }
 
 void avoidHesitatingCursor()

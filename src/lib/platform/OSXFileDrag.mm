@@ -607,6 +607,23 @@ DestPtr findDest(StatePtr s, uint32_t id); // any thread
   return NO;
 }
 
+// A drag that stays over a window which is neither key nor main gets "spring loaded": after
+// about 0.75 s AppKit brings that window to the front and activates its app. A parked drag
+// stays over these windows for as long as the cursor is on the other computer, so this app
+// came forward during every drag (taking the focus from the user's app) and an edge window
+// that was hidden for the hand-off showed again. AppKit does not spring a main window.
+- (BOOL)isMainWindow
+{
+  return YES;
+}
+
+- (void)makeKeyAndOrderFront:(id)sender
+{
+  // these windows show with placeAt: only. This is the spring loading above: seen in the
+  // log, it means the system still tries to bring the window under a drag forward
+  LOG_INFO("file drag: window %ld was asked to come to the front; it stays", static_cast<long>(self.windowNumber));
+}
+
 - (void)placeAt:(const fd::EdgeRect &)rect
 {
   [self setFrame:cocoaFrame(rect) display:NO];
