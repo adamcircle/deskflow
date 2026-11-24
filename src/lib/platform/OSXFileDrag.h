@@ -49,8 +49,9 @@ public:
     std::function<void(uint32_t dragId, int32_t x, int32_t y)> launcherReady;
     //! destination: the native drag loop ended (dropped or not); let go of our press
     std::function<void(uint32_t dragId, bool dropped)> loopEnded;
-    //! destination: end a running drag over the refusing window at x,y (move there, let go)
-    std::function<void(int32_t x, int32_t y)> releaseAt;
+    //! destination: move a running drag a little at x,y, where the refusing window is, so that
+    //! it looks at that window; with \p letGo also let go of the button there, which ends it
+    std::function<void(int32_t x, int32_t y, bool letGo)> releaseAt;
     //! source: sending \p dragId stopped here (failed or nothing to send); a cancel went out
     std::function<void(uint32_t dragId)> sourceStopped;
   };

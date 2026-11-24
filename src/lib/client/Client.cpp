@@ -923,10 +923,8 @@ void Client::fileDragReceive(const Message &message)
   }
 
   if (message.type == Message::Type::Icon) {
-    // arrives just before its Begin
-    if (!m_fileDragLooping) {
-      m_computer->fileDragReceive(message);
-    }
+    // arrives just before its Begin; the platform keeps it for the drag with its id
+    m_computer->fileDragReceive(message);
     return;
   }
 
@@ -934,8 +932,6 @@ void Client::fileDragReceive(const Message &message)
     CancelReason refusal = CancelReason::Unknown;
     if ((fileDragCapabilities() & deskflow::filedrag::kCapDestination) == 0) {
       refusal = CancelReason::Unsupported;
-    } else if (m_fileDragLooping) {
-      refusal = CancelReason::Busy;
     } else if (!m_active) {
       // the cursor already left again
       refusal = CancelReason::CursorReturned;
@@ -945,7 +941,11 @@ void Client::fileDragReceive(const Message &message)
       m_server->fileDragSend(Message::cancel(message.dragId, refusal));
       return;
     }
-    if (m_fileDragId != 0) {
+    if (m_fileDragLooping) {
+      // the cursor left with the button held and is back before the drag it left here has
+      // ended: the platform starts this one as soon as that one is gone
+      LOG_INFO("file drag %u follows drag %u, which is still ending here", message.dragId, m_fileDragId);
+    } else if (m_fileDragId != 0) {
       // the previous drag is still copying: it carries on, this one replaces it here
       LOG_DEBUG("file drag %u starts while %u still copies", message.dragId, m_fileDragId);
     }

@@ -81,6 +81,12 @@ constexpr uint64_t kFinderProgressMinBytes = 50ull * 1024 * 1024;
 //! How often Finder progress is updated while bytes arrive (at most ~10 times per second)
 constexpr auto kProgressUpdateInterval = std::chrono::milliseconds(100);
 //! How often a parked drag that is not over the catcher yet is moved there again, and how many times
+//! How often a cancelled drag is moved over the refusing window again before it is let go there, and how many times
+constexpr double kRefuseRetrySeconds = 0.02;
+constexpr int kRefuseTries = 10;
+//! How often a new drag looks whether the drag before it has ended, and how many times
+constexpr double kFollowRetrySeconds = 0.02;
+constexpr int kFollowTries = 150;
 constexpr CGKeyCode kEscapeKeyCode = 53;
 constexpr double kParkRetrySeconds = 0.03;
 constexpr int kParkTries = 10;
@@ -375,6 +381,7 @@ struct OSXFileDrag::State : public std::enable_shared_from_this<OSXFileDrag::Sta
   DestPtr launcherSession;
   uint64_t launcherGeneration = 0;
   DestPtr loopSession;
+  bool refuserOver = false; ///< the running drag is over the refusing window (main thread)
   std::vector<DestPtr> pendingRemoval;
   int removalTries = 0;
 
@@ -736,6 +743,7 @@ void offerReady(StatePtr s);
 void offerLost(StatePtr s);
 void onFilesEntered(StatePtr s, std::vector<fs::path> paths, id<NSDraggingInfo> sender, NSView *view);
 void checkParked(StatePtr s, uint64_t generation, int attempt);
+void showLauncherMain(StatePtr s, DestPtr session, int waited);
 void unpark(StatePtr s, const char *why);
 void startDrag(StatePtr s, DestPtr session, NSView *view, NSEvent *event);
 void loopEnded(StatePtr s, NSDragOperation operation);
@@ -1048,6 +1056,11 @@ struct FinderProgress
     // a parked drag moves from the edge window to the catcher, or something moved it off
     // the catcher: checkParked() puts it back
     s->parkedOver = false;
+    if (_catcher && !CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonLeft)) {
+      // the button is up: the drag ended here, refused
+      unpark(s, "let go over the catcher");
+      return;
+    }
     if (_catcher) {
       s->catcherEntered = false;
       const uint64_t generation = s->parkGeneration;
@@ -1144,14 +1157,18 @@ struct FinderProgress
 
 //! Secondary: ends a cancelled drag by refusing it, so it drops nowhere
 @interface DFRefuseView : NSView
+- (instancetype)initWithState:(const StatePtr &)state;
 @end
 
-@implementation DFRefuseView
+@implementation DFRefuseView {
+  WeakState _state;
+}
 
-- (instancetype)init
+- (instancetype)initWithState:(const StatePtr &)state
 {
   self = [super initWithFrame:NSMakeRect(0, 0, kLauncherSide, kLauncherSide)];
   if (self != nil) {
+    _state = state;
     NSArray<NSPasteboardType> *types =
         [NSFilePromiseReceiver.readableDraggedTypes arrayByAddingObject:NSPasteboardTypeFileURL];
     [self registerForDraggedTypes:types];
@@ -1161,12 +1178,25 @@ struct FinderProgress
 
 - (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender
 {
+  if (auto s = _state.lock()) {
+    s->refuserOver = true;
+  }
   return NSDragOperationNone;
 }
 
 - (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender
 {
+  if (auto s = _state.lock()) {
+    s->refuserOver = true;
+  }
   return NSDragOperationNone;
+}
+
+- (void)draggingExited:(id<NSDraggingInfo>)sender
+{
+  if (auto s = _state.lock()) {
+    s->refuserOver = false;
+  }
 }
 
 - (BOOL)prepareForDragOperation:(id<NSDraggingInfo>)sender
@@ -1190,6 +1220,7 @@ struct FinderProgress
 - (void)showLauncher:(const fd::EdgeRect &)rect;
 - (void)launcherOutOfTheWay;
 - (void)hideLauncher;
+- (void)readyRefuser:(const fd::EdgeRect &)rect;
 - (void)showRefuser:(const fd::EdgeRect &)rect;
 - (void)hideRefuser;
 - (void)teardown;
@@ -1307,12 +1338,30 @@ struct FinderProgress
   [_launcher orderOut:nil];
 }
 
-- (void)showRefuser:(const fd::EdgeRect &)rect
+- (DFOverlayPanel *)refuser
 {
   if (_refuser == nil) {
-    _refuser = [[DFOverlayPanel alloc] initWithView:[[DFRefuseView alloc] init] level:catcherWindowLevel()];
+    if (auto s = _state.lock()) {
+      _refuser = [[DFOverlayPanel alloc] initWithView:[[DFRefuseView alloc] initWithState:s]
+                                                level:catcherWindowLevel()];
+    }
   }
-  [_refuser placeAt:rect];
+  return _refuser;
+}
+
+// A window that has only just come up is not yet a place a drag can be let go on: a drag
+// let go over it goes to the window under it. So the refusing window comes up when the
+// drag starts, and lets everything through until it is needed
+- (void)readyRefuser:(const fd::EdgeRect &)rect
+{
+  DFOverlayPanel *refuser = [self refuser];
+  [refuser placeAt:rect];
+  refuser.ignoresMouseEvents = YES;
+}
+
+- (void)showRefuser:(const fd::EdgeRect &)rect
+{
+  [[self refuser] placeAt:rect];
 }
 
 - (void)hideRefuser
@@ -1830,6 +1879,9 @@ void checkParked(StatePtr s, uint64_t generation, int attempt)
   if (!s->parked || !s->away || generation != s->parkGeneration || s->catcherEntered) {
     return;
   }
+  if (!CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonLeft)) {
+    return; // the button is up: there is no drag to move any more
+  }
   if (attempt >= kParkTries) {
     LOG_WARN(
         "file drag %u: the local drag does not reach the catcher; it %s", s->parkedDragId,
@@ -2050,6 +2102,40 @@ void finishSession(StatePtr s, DestPtr session)
   eraseDest(s, session->id);
 }
 
+/**
+ * Ends the cancelled drag of \p session where the cursor is: the refusing window goes under
+ * it, the drag is moved a little so that it looks at that window, and only when that window
+ * has the drag is the button let go. Let go sooner, the drag dropped on whatever app was
+ * under the cursor, which then waited for files that never came, and the next drag was
+ * refused while this one hung.
+ */
+void endLoop(StatePtr s, DestPtr session, int attempt)
+{
+  if (s->loopSession != session) {
+    return; // it ended
+  }
+  const CGPoint at = currentCursor();
+  const auto x = static_cast<int32_t>(at.x);
+  const auto y = static_cast<int32_t>(at.y);
+  [controllerOf(s) showRefuser:fd::squareAround(x, y, kLauncherSide, fd::displayAt(x, y, activeDisplays()))];
+  const bool letGo = s->refuserOver || attempt >= kRefuseTries;
+  if (letGo && !s->refuserOver) {
+    LOG_WARN("file drag %u: the drag does not get to the window that refuses it, letting go of it anyway", session->id);
+  } else if (letGo) {
+    LOG_INFO("file drag %u: the drag ends over the window that refuses it (after %d moves)", session->id, attempt);
+  }
+  s->postToCore([s, x, y, letGo] {
+    if (s->hooks.releaseAt) {
+      s->hooks.releaseAt(x, y, letGo);
+    }
+  });
+  if (!letGo) {
+    dispatchMainAfter(kRefuseRetrySeconds, ^{
+      endLoop(s, session, attempt + 1);
+    });
+  }
+}
+
 void onCancelledMain(StatePtr s, DestPtr session)
 {
   switch (session->phase.load()) {
@@ -2067,15 +2153,8 @@ void onCancelledMain(StatePtr s, DestPtr session)
   case DestPhase::Looping: {
     // there is no call that cancels an AppKit drag: end it over a window that refuses it,
     // so it drops nowhere (draggingSession:endedAtPoint: then finishes the cancel)
-    const CGPoint at = currentCursor();
-    const auto x = static_cast<int32_t>(at.x);
-    const auto y = static_cast<int32_t>(at.y);
-    [controllerOf(s) showRefuser:fd::squareAround(x, y, kLauncherSide, fd::displayAt(x, y, activeDisplays()))];
-    s->postToCore([s, x, y] {
-      if (s->hooks.releaseAt) {
-        s->hooks.releaseAt(x, y);
-      }
-    });
+    s->refuserOver = false;
+    endLoop(s, session, 0);
     dispatchMainAfter(3.0, ^{
       if (s->loopSession == session) {
         LOG_ERR("file drag %u: the drag did not end after it was cancelled", session->id);
@@ -2111,9 +2190,28 @@ void cancelSession(StatePtr s, DestPtr session, fd::CancelReason reason, bool te
   });
 }
 
-void showLauncherMain(StatePtr s, DestPtr session)
+void showLauncherMain(StatePtr s, DestPtr session, int waited)
 {
   if (session->cancelled) {
+    return;
+  }
+  if (s->loopSession) {
+    // the cursor left with the button held and is back already: the drag it left here is
+    // still ending. AppKit runs one drag at a time, so this one starts when that one is gone
+    if (waited == 0) {
+      LOG_INFO("file drag %u: starts when drag %u has ended here", session->id, s->loopSession->id);
+      if (!s->loopSession->cancelled) {
+        cancelSession(s, s->loopSession, fd::CancelReason::Busy, true);
+      }
+    }
+    if (waited >= kFollowTries) {
+      LOG_WARN("file drag %u: drag %u does not end here, giving this one up", session->id, s->loopSession->id);
+      cancelSession(s, session, fd::CancelReason::Busy, true);
+      return;
+    }
+    dispatchMainAfter(kFollowRetrySeconds, ^{
+      showLauncherMain(s, session, waited + 1);
+    });
     return;
   }
   DFFileDragController *c = controllerOf(s);
@@ -2207,6 +2305,12 @@ void startDrag(StatePtr s, DestPtr session, NSView *view, NSEvent *event)
     postLoopEnded(s, session->id, false);
     return;
   }
+  // under the cursor from now on, letting everything through, for the case that the drag is cancelled
+  const CGPoint cursor = currentCursor();
+  const auto cursorX = static_cast<int32_t>(cursor.x);
+  const auto cursorY = static_cast<int32_t>(cursor.y);
+  s->refuserOver = false;
+  [c readyRefuser:fd::squareAround(cursorX, cursorY, kLauncherSide, fd::displayAt(cursorX, cursorY, activeDisplays()))];
   drag.animatesToStartingPositionsOnCancelOrFail = NO;
   drag.draggingFormation = preview ? NSDraggingFormationNone : NSDraggingFormationPile;
   if (preview) {
@@ -2396,7 +2500,7 @@ void beginSession(StatePtr s, const fd::Message &message)
       session->staging.stagingDir().c_str()
   );
   dispatchMain(^{
-    showLauncherMain(s, session);
+    showLauncherMain(s, session, 0);
   });
 }
 

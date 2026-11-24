@@ -1876,7 +1876,7 @@ void OSXComputer::startFileDrag()
   OSXFileDrag::Hooks hooks;
   hooks.launcherReady = [this](uint32_t dragId, int32_t x, int32_t y) { onFileDragLauncherReady(dragId, x, y); };
   hooks.loopEnded = [this](uint32_t dragId, bool dropped) { onFileDragLoopEnded(dragId, dropped); };
-  hooks.releaseAt = [this](int32_t x, int32_t y) { onFileDragReleaseAt(x, y); };
+  hooks.releaseAt = [this](int32_t x, int32_t y, bool letGo) { onFileDragReleaseAt(x, y, letGo); };
   hooks.sourceStopped = [this](uint32_t dragId) { onFileDragSourceStopped(dragId); };
   m_fileDrag = std::make_unique<OSXFileDrag>(m_events, getEventTarget(), m_isPrimary, std::move(hooks));
 }
@@ -1930,6 +1930,7 @@ void OSXComputer::fileDragReceive(const deskflow::filedrag::Message &message)
     // the button is held on the other computer; the start window asks for the press next.
     // On the server, flags 1 says the user already let go: the drag drops as soon as it starts
     m_fileDragAwaitingPress = true;
+    m_fileDragAwaitingId = message.dragId;
     m_fileDragReleasedEarly = m_isPrimary && (message.flags & 1) != 0;
   }
   if (!m_isPrimary && m_fileDragParkedId != 0) {
@@ -2054,10 +2055,8 @@ void OSXComputer::onFileDragLauncherReady(uint32_t dragId, int32_t x, int32_t y)
   }
 }
 
-void OSXComputer::onFileDragLoopEnded(uint32_t, bool)
+void OSXComputer::onFileDragLoopEnded(uint32_t dragId, bool)
 {
-  m_fileDragAwaitingPress = false;
-  m_fileDragReleasedEarly = false;
   fileDragStopReleaseTimer();
   if (m_fileDragPressed && !m_isPrimary) {
     // ended while our press was still held: let go of it
@@ -2065,24 +2064,41 @@ void OSXComputer::onFileDragLoopEnded(uint32_t, bool)
   }
   // on the server the user's own button is still held; its release just ends there
   m_fileDragPressed = false;
+  if (m_fileDragAwaitingPress && dragId != m_fileDragAwaitingId) {
+    // the next drag was announced while this one ended: it still waits for its press
+    return;
+  }
+  m_fileDragAwaitingPress = false;
+  m_fileDragReleasedEarly = false;
 }
 
-void OSXComputer::onFileDragReleaseAt(int32_t x, int32_t y)
+void OSXComputer::onFileDragReleaseAt(int32_t x, int32_t y, bool letGo)
 {
   // a cancelled drag: move over the refusing window (so the drag sees it) and let go there
   if (m_isPrimary) {
     if (m_fileDragPressed) {
       postFileDragMove(x + 1, y, true);
       postFileDragMove(x, y, true);
-      m_fileDragPressed = false;
-      postFileDragButton(false, x, y);
+      if (letGo) {
+        m_fileDragPressed = false;
+        postFileDragButton(false, x, y);
+      }
     }
     return;
   }
+  if (!m_fileDragPressed) {
+    return;
+  }
+  // enter() forgets the buttons, and the cursor may be back here already: the drag only
+  // follows, and only ends with, the button our press holds
+  const bool forgotten = !m_buttonState.test(0);
+  m_buttonState.set(0, kMouseButtonDown);
   fakeMouseMove(x + 1, y);
   fakeMouseMove(x, y);
-  if (m_buttonState.test(0)) {
+  if (letGo) {
     fakeMouseButton(kButtonLeft, false);
+  } else if (forgotten) {
+    m_buttonState.set(0, kMouseButtonUp);
   }
 }
 

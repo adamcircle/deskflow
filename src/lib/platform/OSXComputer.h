@@ -336,7 +336,7 @@ private:
   void startFileDrag();
   void onFileDragLauncherReady(uint32_t dragId, int32_t x, int32_t y);
   void onFileDragLoopEnded(uint32_t dragId, bool dropped);
-  void onFileDragReleaseAt(int32_t x, int32_t y);
+  void onFileDragReleaseAt(int32_t x, int32_t y, bool letGo);
   void fileDragStopReleaseTimer();
   void onFileDragSourceStopped(uint32_t dragId);
   //! client: lets go of the button the server pressed, ending the parked drag on the catcher
@@ -352,6 +352,8 @@ private:
   std::atomic<bool> m_fileDragPressed{false};
   //! a drag arrived (Begin) and its button press has not been made yet
   std::atomic<bool> m_fileDragAwaitingPress{false};
+  //! the drag that waits for it (core thread)
+  uint32_t m_fileDragAwaitingId = 0;
   //! the user let go before that press; the drag drops as soon as it starts
   std::atomic<bool> m_fileDragReleasedEarly{false};
   EventQueueTimer *m_fileDragReleaseTimer = nullptr;
