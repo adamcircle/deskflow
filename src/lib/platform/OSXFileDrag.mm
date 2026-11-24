@@ -111,8 +111,8 @@ constexpr CGFloat kPreviewMinPixelsPerPoint = 0.75;
 constexpr size_t kPictureItems = 3;
 //! How far each item behind the first is set off, up and to the right, in points
 constexpr CGFloat kPictureStackStep = 6;
-//! Space between the icon and the name, in points
-constexpr CGFloat kPictureLabelGap = 4;
+//! Space between the icon and the name, in points (the name's baseline is then where Finder has it)
+constexpr CGFloat kPictureLabelGap = 5;
 //! Icon, label text and grid spacing ranges for a picture of a Finder drag (defaults match Finder's)
 constexpr CGFloat kPictureMinIconSize = 16;
 constexpr CGFloat kPictureMaxIconSize = 128;
@@ -123,7 +123,7 @@ constexpr CGFloat kPictureDefaultTextSize = 12;
 constexpr CGFloat kPictureMinGridSpacing = 1;
 constexpr CGFloat kPictureMaxGridSpacing = 100;
 constexpr CGFloat kPictureDefaultGridSpacing = 54;
-//! Bounds on the label text width derived from Finder's icon size and grid spacing, in points
+//! Bounds on the width the name may take, which follows Finder's icon size and grid spacing, in points
 constexpr CGFloat kPictureMinLabelWidth = 64;
 constexpr CGFloat kPictureMaxLabelWidth = 180;
 //! Highest pixel density of the picture, whatever this computer's screen is (the other one may be
@@ -141,7 +141,7 @@ struct FinderIconViewMetrics
 {
   CGFloat iconSize = kPictureDefaultIconSize;
   CGFloat textSize = kPictureDefaultTextSize;
-  CGFloat labelWidth = kPictureDefaultIconSize + kPictureDefaultGridSpacing - 6 - 2 * kPictureLabelPadX;
+  CGFloat labelWidth = kPictureDefaultIconSize + kPictureDefaultGridSpacing - 6;
 };
 
 enum class DestPhase : int
@@ -1626,12 +1626,67 @@ FinderIconViewMetrics finderIconViewMetrics()
   gridSpacing = std::clamp(gridSpacing, kPictureMinGridSpacing, kPictureMaxGridSpacing);
 
   // Finder's icon-view cell width tracks iconSize + gridSpacing (at 64 and 54 it measures
-  // 112 pt across, with ~100 pt of text inside the selection pill padding).
+  // 112 pt across), and a name may be as wide as the cell
   const CGFloat minLabel = std::max(iconSize, kPictureMinLabelWidth);
-  const CGFloat labelWidth =
-      std::clamp(iconSize + gridSpacing - 6 - 2 * kPictureLabelPadX, minLabel, kPictureMaxLabelWidth);
+  const CGFloat labelWidth = std::clamp(iconSize + gridSpacing - 6, minLabel, kPictureMaxLabelWidth);
 
   return {iconSize, textSize, labelWidth};
+}
+
+//! Whether \p path is an item right on the desktop
+bool isOnDesktop(const fs::path &path)
+{
+  NSString *desktop = NSSearchPathForDirectoriesInDomains(NSDesktopDirectory, NSUserDomainMask, YES)
+                          .firstObject.stringByStandardizingPath;
+  NSString *folder = toNSString(path.parent_path().string()).stringByStandardizingPath;
+  return desktop != nil && [folder isEqualToString:desktop];
+}
+
+/**
+ * \p name as Finder's icon view shows a name that is wider than \p width: on two lines,
+ * broken between words if it can be, and with the middle of the second line left out ("…") if
+ * that is still too wide. Core Text leaves out the same letters as Finder does; the
+ * truncation of NSLayoutManager does not.
+ */
+NSString *labelLines(NSString *name, NSFont *font, CGFloat width)
+{
+  NSDictionary *attributes = @{NSFontAttributeName : font};
+  NSAttributedString *whole = [[NSAttributedString alloc] initWithString:name attributes:attributes];
+  CTTypesetterRef typesetter = CTTypesetterCreateWithAttributedString((__bridge CFAttributedStringRef)whole);
+  const CFIndex first = CTTypesetterSuggestLineBreak(typesetter, 0, width);
+  CFRelease(typesetter);
+  if (first <= 0 || first >= static_cast<CFIndex>(name.length)) {
+    return name;
+  }
+  NSCharacterSet *spaces = NSCharacterSet.whitespaceAndNewlineCharacterSet;
+  NSString *top = [[name substringToIndex:first] stringByTrimmingCharactersInSet:spaces];
+  NSString *rest = [[name substringFromIndex:first] stringByTrimmingCharactersInSet:spaces];
+
+  // the "…" carries a mark, to tell it from the letters that are left in the line
+  NSString *const cutKey = @"DFFileDragCut";
+  NSMutableDictionary *cutAttributes = [attributes mutableCopy];
+  cutAttributes[cutKey] = @YES;
+  NSAttributedString *restText = [[NSAttributedString alloc] initWithString:rest attributes:attributes];
+  NSAttributedString *cutText = [[NSAttributedString alloc] initWithString:@"…" attributes:cutAttributes];
+  CTLineRef line = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)restText);
+  CTLineRef token = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)cutText);
+  CTLineRef cut = CTLineCreateTruncatedLine(line, width, kCTLineTruncationMiddle, token);
+  NSMutableString *bottom = [NSMutableString string];
+  if (cut != nullptr) {
+    for (id each in (__bridge NSArray *)CTLineGetGlyphRuns(cut)) {
+      CTRunRef run = (__bridge CTRunRef)each;
+      if (((__bridge NSDictionary *)CTRunGetAttributes(run))[cutKey] != nil) {
+        [bottom appendString:@"…"];
+      } else {
+        const CFRange range = CTRunGetStringRange(run);
+        [bottom appendString:[rest substringWithRange:NSMakeRange(range.location, range.length)]];
+      }
+    }
+    CFRelease(cut);
+  }
+  CFRelease(token);
+  CFRelease(line);
+  return [NSString stringWithFormat:@"%@\n%@", top, bottom.length > 0 ? bottom : rest];
 }
 
 /**
@@ -1665,13 +1720,17 @@ void makePicture(StatePtr s, const std::shared_ptr<Offer> &offer)
     }
   }
 
-  // the name as Finder shows it (it may hide the extension): centred, two lines at most
+  // the name as Finder shows it (it may hide the extension): centred, two lines at most,
+  // bold on the desktop and regular in a window
   NSString *name = [[NSFileManager defaultManager] displayNameAtPath:toNSString(offer->paths.front().string())];
+  const bool bold = isOnDesktop(offer->paths.front());
+  NSFont *font = bold ? [NSFont boldSystemFontOfSize:textSize] : [NSFont systemFontOfSize:textSize];
   NSMutableParagraphStyle *style = [[NSMutableParagraphStyle alloc] init];
   style.alignment = NSTextAlignmentCenter;
-  NSTextStorage *storage = [[NSTextStorage alloc] initWithString:name
+  style.lineBreakMode = NSLineBreakByClipping;
+  NSTextStorage *storage = [[NSTextStorage alloc] initWithString:labelLines(name, font, labelWidth)
                                                       attributes:@{
-                                                        NSFontAttributeName : [NSFont systemFontOfSize:textSize],
+                                                        NSFontAttributeName : font,
                                                         NSForegroundColorAttributeName : NSColor.whiteColor,
                                                         NSParagraphStyleAttributeName : style,
                                                       }];
@@ -1679,7 +1738,6 @@ void makePicture(StatePtr s, const std::shared_ptr<Offer> &offer)
   NSTextContainer *container = [[NSTextContainer alloc] initWithSize:NSMakeSize(labelWidth, CGFLOAT_MAX)];
   container.lineFragmentPadding = 0;
   container.maximumNumberOfLines = 2;
-  container.lineBreakMode = NSLineBreakByTruncatingMiddle;
   [layout addTextContainer:container];
   [storage addLayoutManager:layout];
   const NSRange glyphs = [layout glyphRangeForTextContainer:container];
@@ -1739,9 +1797,9 @@ void makePicture(StatePtr s, const std::shared_ptr<Offer> &offer)
   fd::setIconPointWidth(offer->picture, static_cast<uint16_t>(std::lround(width / scale)));
   LOG_INFO(
       "file drag: picture of the drag made from its files (%zu of %zu items, %zu thumbnails, %zu icons, \"%s\"): %ux%u "
-      "px (%.2f px/pt), %u points wide (icon %.0f pt, text %.0f pt), %.0f ms after the files were known",
+      "px (%.2f px/pt), %u points wide (icon %.0f pt, text %.0f pt %s), %.0f ms after the files were known",
       shown, offer->paths.size(), thumbnails, shown - thumbnails, toUtf8(name).c_str(), offer->picture.width,
-      offer->picture.height, scale, fd::iconPointWidth(offer->picture), side, textSize,
+      offer->picture.height, scale, fd::iconPointWidth(offer->picture), side, textSize, bold ? "bold" : "regular",
       (CFAbsoluteTimeGetCurrent() - offer->pictureStarted) * 1000.0
   );
 }
