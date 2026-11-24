@@ -317,7 +317,12 @@ int32_t OSXComputer::getJumpZoneSize() const
 
 bool OSXComputer::isAnyMouseButtonDown(uint32_t &buttonID) const
 {
-  if (m_buttonState.test(0)) {
+  // m_buttonState is what this computer was told to press, which only a client is. On the
+  // server it is a snapshot from the last time the cursor left (updateButtons()); a file
+  // drag leaves with the left button held, and that snapshot would then report the button
+  // as held forever and keep the cursor from ever coming back. The server's buttons are the
+  // physical ones, queried below.
+  if (!m_isPrimary && m_buttonState.test(0)) {
     buttonID = kButtonLeft;
     return true;
   }
