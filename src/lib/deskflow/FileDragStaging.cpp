@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <map>
 #include <set>
 #include <system_error>
@@ -19,6 +20,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #else
+#include <fcntl.h>
 #include <signal.h>
 #include <unistd.h>
 #endif
@@ -170,6 +172,66 @@ MoveResult copyNoReplace(const fs::path &source, const fs::path &target, bool is
   return MoveResult::Moved;
 }
 
+enum class ReserveResult
+{
+  Created,
+  Exists,
+  Failed
+};
+
+ReserveResult createPlaceholder(const fs::path &target, bool isDirectory)
+{
+  if (isDirectory) {
+    std::error_code ec;
+    if (fs::create_directory(target, ec)) {
+      return ReserveResult::Created;
+    }
+    if (!ec || ec == std::errc::file_exists) {
+      return ReserveResult::Exists;
+    }
+    return ReserveResult::Failed;
+  }
+
+#if defined(_WIN32)
+  HANDLE file = CreateFileW(
+      target.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_NEW,
+      FILE_ATTRIBUTE_NORMAL, nullptr
+  );
+  if (file != INVALID_HANDLE_VALUE) {
+    CloseHandle(file);
+    return ReserveResult::Created;
+  }
+  const DWORD err = GetLastError();
+  if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) {
+    return ReserveResult::Exists;
+  }
+  return ReserveResult::Failed;
+#else
+  const int fd = ::open(target.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+  if (fd >= 0) {
+    ::close(fd);
+    return ReserveResult::Created;
+  }
+  if (errno == EEXIST) {
+    return ReserveResult::Exists;
+  }
+  return ReserveResult::Failed;
+#endif
+}
+
+bool isEmptyPlaceholder(const fs::path &path, bool isDirectory)
+{
+  std::error_code ec;
+  const auto status = fs::symlink_status(path, ec);
+  if (ec) {
+    return false;
+  }
+  if (isDirectory) {
+    return status.type() == fs::file_type::directory && fs::is_empty(path, ec) && !ec;
+  }
+  return status.type() == fs::file_type::regular && fs::file_size(path, ec) == 0 && !ec;
+}
+
 std::atomic<uint32_t> g_stagingCounter{0};
 
 } // namespace
@@ -293,16 +355,19 @@ bool FileDragStaging::begin(uint32_t dragId, const ItemList &items, CancelReason
   m_entries.clear();
   m_files.assign(items.size(), FileState{});
 
-  // remote folder path -> local folder path, and the names used in each local folder
+  // remote folder path -> local folder path, its owning top-level index, and used names per local folder
   std::map<std::string, std::string> localDirs;
+  std::map<std::string, uint32_t> topDirs;
   std::map<std::string, std::set<std::string>> usedNames;
 
   for (const auto &item : items) {
+    const auto index = static_cast<uint32_t>(m_entries.size());
     const auto slash = item.path.rfind('/');
     const std::string remoteParent = slash == std::string::npos ? std::string() : item.path.substr(0, slash);
     const std::string remoteName = slash == std::string::npos ? item.path : item.path.substr(slash + 1);
     const std::string localParent = remoteParent.empty() ? std::string() : localDirs.at(remoteParent);
     const fs::path localParentPath = localParent.empty() ? m_dir : m_dir / fromUtf8(localParent);
+    const uint32_t topIndex = remoteParent.empty() ? index : topDirs.at(remoteParent);
 
     auto &used = usedNames[localParent];
     const auto name = uniqueName(sanitizeComponent(remoteName), item.isDirectory, [&](const std::string &candidate) {
@@ -320,6 +385,7 @@ bool FileDragStaging::begin(uint32_t dragId, const ItemList &items, CancelReason
     const auto path = m_dir / fromUtf8(entry.localPath);
     if (item.isDirectory) {
       localDirs[item.path] = entry.localPath;
+      topDirs[item.path] = topIndex;
       if (!fs::create_directory(path, ec)) {
         reason = CancelReason::WriteFailed;
         setError(error, "cannot create staged folder");
@@ -335,7 +401,9 @@ bool FileDragStaging::begin(uint32_t dragId, const ItemList &items, CancelReason
         failLocked();
         return false;
       }
+      m_files[topIndex].itemTotal += item.size;
     }
+    m_files[index].topIndex = topIndex;
     m_entries.push_back(std::move(entry));
   }
   return true;
@@ -379,6 +447,7 @@ bool FileDragStaging::write(uint32_t index, const std::string &data)
     return false;
   }
   state.written += data.size();
+  m_files[state.topIndex].itemWritten += data.size();
   m_cond.notify_all();
   return true;
 }
@@ -556,6 +625,24 @@ uint64_t FileDragStaging::receivedBytes() const
   return total;
 }
 
+uint64_t FileDragStaging::itemTotalBytes(uint32_t top) const
+{
+  std::scoped_lock lock(m_mutex);
+  if (!m_begun || top >= m_files.size() || m_files[top].topIndex != top) {
+    return 0;
+  }
+  return m_files[top].itemTotal;
+}
+
+uint64_t FileDragStaging::itemReceivedBytes(uint32_t top) const
+{
+  std::scoped_lock lock(m_mutex);
+  if (!m_begun || top >= m_files.size() || m_files[top].topIndex != top) {
+    return 0;
+  }
+  return m_files[top].itemWritten;
+}
+
 fs::path FileDragStaging::pathOf(uint32_t index) const
 {
   if (index >= m_entries.size()) {
@@ -597,6 +684,123 @@ bool FileDragStaging::moveNoReplace(
   }
   setError(error, "no free name for " + name);
   return false;
+}
+
+bool FileDragStaging::reservePlaceholder(
+    const fs::path &destinationDir, const std::string &name, bool isDirectory, fs::path &reserved, std::string *error
+)
+{
+  std::set<std::string> tried;
+  for (int attempt = 0; attempt < 1000; ++attempt) {
+    const auto candidate = uniqueName(name, isDirectory, [&](const std::string &n) {
+      std::error_code ec;
+      const auto p = destinationDir / fromUtf8(n);
+      return tried.contains(nameKey(n)) || fs::exists(p, ec) || fs::is_symlink(p, ec);
+    });
+    tried.insert(nameKey(candidate));
+    const auto target = destinationDir / fromUtf8(candidate);
+
+    switch (createPlaceholder(target, isDirectory)) {
+    case ReserveResult::Created:
+      reserved = target;
+      return true;
+    case ReserveResult::Exists:
+      // someone took the name between our check and creating the placeholder: try the next one
+      continue;
+    case ReserveResult::Failed:
+      setError(error, "cannot reserve " + name);
+      return false;
+    }
+  }
+  setError(error, "no free name for " + name);
+  return false;
+}
+
+bool FileDragStaging::replacePlaceholder(
+    const fs::path &source, const fs::path &placeholder, bool isDirectory, fs::path &placed, std::string *error
+)
+{
+  if (!isEmptyPlaceholder(placeholder, isDirectory)) {
+    // the placeholder vanished or something else took its place: never overwrite
+    return moveNoReplace(source, placeholder.parent_path(), toUtf8(placeholder.filename()), isDirectory, placed, error);
+  }
+
+  MoveResult result = MoveResult::Failed;
+#if defined(_WIN32)
+  if (!isDirectory) {
+    if (MoveFileExW(source.c_str(), placeholder.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+      result = MoveResult::Moved;
+    } else if (GetLastError() == ERROR_NOT_SAME_DEVICE) {
+      result = MoveResult::CrossDevice;
+    }
+  } else {
+    // MoveFileExW cannot replace an existing directory; remove the empty placeholder first
+    std::error_code ec;
+    if (fs::remove(placeholder, ec)) {
+      result = renameNoReplace(source, placeholder);
+      if (result == MoveResult::Exists) {
+        return moveNoReplace(
+            source, placeholder.parent_path(), toUtf8(placeholder.filename()), isDirectory, placed, error
+        );
+      }
+      if (result == MoveResult::Failed) {
+        result = MoveResult::CrossDevice;
+      }
+    }
+  }
+#else
+  if (::rename(source.c_str(), placeholder.c_str()) == 0) {
+    result = MoveResult::Moved;
+  } else if (errno == EXDEV) {
+    result = MoveResult::CrossDevice;
+  } else if (errno == ENOTEMPTY || errno == EEXIST || errno == ENOTDIR || errno == EISDIR) {
+    // something changed at the placeholder path in between: never overwrite
+    return moveNoReplace(source, placeholder.parent_path(), toUtf8(placeholder.filename()), isDirectory, placed, error);
+  }
+#endif
+
+  if (result == MoveResult::CrossDevice) {
+    std::error_code ec;
+    if (isDirectory) {
+      if (!fs::exists(placeholder, ec) && !fs::create_directory(placeholder, ec)) {
+        setError(error, "cannot replace " + toUtf8(source.filename()));
+        return false;
+      }
+      fs::copy(source, placeholder, fs::copy_options::recursive, ec);
+      if (ec) {
+        fs::remove_all(placeholder, ec);
+        setError(error, "cannot copy " + toUtf8(source.filename()));
+        return false;
+      }
+      fs::remove_all(source, ec);
+      result = MoveResult::Moved;
+    } else if (fs::copy_file(source, placeholder, fs::copy_options::overwrite_existing, ec)) {
+      fs::remove(source, ec);
+      result = MoveResult::Moved;
+    } else {
+      fs::remove(placeholder, ec);
+    }
+  }
+
+  if (result == MoveResult::Moved) {
+    placed = placeholder;
+    return true;
+  }
+  setError(error, "cannot replace " + toUtf8(source.filename()));
+  return false;
+}
+
+bool FileDragStaging::removePlaceholder(const fs::path &placeholder, bool isDirectory)
+{
+  std::error_code ec;
+  const auto status = fs::symlink_status(placeholder, ec);
+  if (status.type() == fs::file_type::not_found) {
+    return true;
+  }
+  if (ec || !isEmptyPlaceholder(placeholder, isDirectory)) {
+    return false;
+  }
+  return fs::remove(placeholder, ec) && !ec;
 }
 
 bool FileDragStaging::moveInto(const fs::path &targetDir, std::vector<fs::path> *placed, std::string *error)

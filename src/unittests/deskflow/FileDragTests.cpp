@@ -866,6 +866,93 @@ void FileDragTests::moveNoReplacePicksFreeName()
   QVERIFY(!fs::exists(base / "src" / "x.txt"));
 }
 
+void FileDragTests::placeholderReservesReplacesAndNeverOverwrites()
+{
+  QTemporaryDir temp;
+  const fs::path base = temp.path().toStdWString();
+  const fs::path dst = base / "dst";
+  fs::create_directories(dst);
+
+  // existing file stays untouched; placeholder picks the next free name and is replaced in place
+  writeFile(dst / "video.mp4", "existing");
+  writeFile(base / "src" / "video.mp4", "arrived-bytes");
+  fs::path reserved;
+  QVERIFY(FileDragStaging::reservePlaceholder(dst, "video.mp4", false, reserved));
+  QCOMPARE(reserved.filename().string(), std::string("video (2).mp4"));
+  QVERIFY(fs::is_regular_file(reserved));
+  QCOMPARE(fs::file_size(reserved), 0ull);
+  fs::path placed;
+  QVERIFY(FileDragStaging::replacePlaceholder(base / "src" / "video.mp4", reserved, false, placed));
+  QCOMPARE(placed, reserved);
+  QCOMPARE(readFile(dst / "video.mp4"), std::string("existing"));
+  QCOMPARE(readFile(placed), std::string("arrived-bytes"));
+  QVERIFY(!fs::exists(base / "src" / "video.mp4"));
+
+  // existing folder stays untouched; placeholder folder is replaced with the staged tree
+  writeFile(dst / "Album" / "old.txt", "old");
+  writeFile(base / "src" / "Album" / "sub" / "pic.jpg", "jpg");
+  fs::path dirReserved;
+  QVERIFY(FileDragStaging::reservePlaceholder(dst, "Album", true, dirReserved));
+  QCOMPARE(dirReserved.filename().string(), std::string("Album (2)"));
+  QVERIFY(fs::is_directory(dirReserved));
+  QVERIFY(fs::is_empty(dirReserved));
+  fs::path dirPlaced;
+  QVERIFY(FileDragStaging::replacePlaceholder(base / "src" / "Album", dirReserved, true, dirPlaced));
+  QCOMPARE(dirPlaced, dirReserved);
+  QCOMPARE(readFile(dst / "Album" / "old.txt"), std::string("old"));
+  QCOMPARE(readFile(dirPlaced / "sub" / "pic.jpg"), std::string("jpg"));
+  QVERIFY(!fs::exists(base / "src" / "Album"));
+
+  // if something writes into the placeholder before replace, never overwrite it
+  fs::path busyFile;
+  QVERIFY(FileDragStaging::reservePlaceholder(dst, "busy.bin", false, busyFile));
+  writeFile(busyFile, "other-app");
+  writeFile(base / "src" / "busy.bin", "ours");
+  fs::path busyPlaced;
+  QVERIFY(FileDragStaging::replacePlaceholder(base / "src" / "busy.bin", busyFile, false, busyPlaced));
+  QVERIFY(busyPlaced != busyFile);
+  QCOMPARE(readFile(busyFile), std::string("other-app"));
+  QCOMPARE(readFile(busyPlaced), std::string("ours"));
+
+  // non-empty placeholder folder is also never overwritten
+  fs::path busyDir;
+  QVERIFY(FileDragStaging::reservePlaceholder(dst, "BusyDir", true, busyDir));
+  writeFile(busyDir / "keep.txt", "keep");
+  writeFile(base / "src" / "BusyDir" / "new.txt", "new");
+  fs::path busyDirPlaced;
+  QVERIFY(FileDragStaging::replacePlaceholder(base / "src" / "BusyDir", busyDir, true, busyDirPlaced));
+  QVERIFY(busyDirPlaced != busyDir);
+  QCOMPARE(readFile(busyDir / "keep.txt"), std::string("keep"));
+  QCOMPARE(readFile(busyDirPlaced / "new.txt"), std::string("new"));
+}
+
+void FileDragTests::placeholderRemoveOnlyDeletesEmpty()
+{
+  QTemporaryDir temp;
+  const fs::path dst = temp.path().toStdWString();
+
+  fs::path filePlaceholder;
+  QVERIFY(FileDragStaging::reservePlaceholder(dst, "a.bin", false, filePlaceholder));
+  QVERIFY(FileDragStaging::removePlaceholder(filePlaceholder, false));
+  QVERIFY(!fs::exists(filePlaceholder));
+  // already gone is fine
+  QVERIFY(FileDragStaging::removePlaceholder(filePlaceholder, false));
+
+  fs::path dirPlaceholder;
+  QVERIFY(FileDragStaging::reservePlaceholder(dst, "Dir", true, dirPlaceholder));
+  QVERIFY(FileDragStaging::removePlaceholder(dirPlaceholder, true));
+  QVERIFY(!fs::exists(dirPlaceholder));
+
+  // non-empty file or folder is left alone
+  writeFile(dst / "real.bin", "data");
+  QVERIFY(!FileDragStaging::removePlaceholder(dst / "real.bin", false));
+  QCOMPARE(readFile(dst / "real.bin"), std::string("data"));
+
+  writeFile(dst / "RealDir" / "inside.txt", "x");
+  QVERIFY(!FileDragStaging::removePlaceholder(dst / "RealDir", true));
+  QCOMPARE(readFile(dst / "RealDir" / "inside.txt"), std::string("x"));
+}
+
 //
 // sending
 //
@@ -1430,6 +1517,40 @@ void FileDragTests::stagingWaitForItemRejectsNestedIndex()
   // only top-level items can be waited for: a promise is made per top-level item
   QCOMPARE(staging.waitForItem(1, std::chrono::milliseconds(1)), WaitResult::Failed);
   QCOMPARE(staging.waitForItem(7, std::chrono::milliseconds(1)), WaitResult::Failed);
+}
+
+void FileDragTests::stagingTracksPerItemProgress()
+{
+  QTemporaryDir temp;
+  FileDragStaging staging(fs::path(temp.path().toStdWString()));
+  CancelReason reason;
+  const ItemList items{
+      {"Photos", 0, true},        {"Photos/2026", 0, true}, {"Photos/2026/a.jpg", 5, false},
+      {"Photos/b.jpg", 4, false}, {"solo.bin", 6, false},
+  };
+  QVERIFY(staging.begin(6, items, reason));
+  QCOMPARE(staging.itemTotalBytes(0), 9ull);
+  QCOMPARE(staging.itemTotalBytes(4), 6ull);
+  // nested and out-of-range indices are not top-level items
+  QCOMPARE(staging.itemTotalBytes(1), 0ull);
+  QCOMPARE(staging.itemTotalBytes(2), 0ull);
+  QCOMPARE(staging.itemTotalBytes(99), 0ull);
+
+  QVERIFY(staging.fileStart(2, 5));
+  QVERIFY(staging.write(2, "he"));
+  QCOMPARE(staging.itemReceivedBytes(0), 2ull);
+  QCOMPARE(staging.itemReceivedBytes(4), 0ull);
+  QVERIFY(staging.write(2, "llo") && staging.fileEnd(2));
+  QCOMPARE(staging.itemReceivedBytes(0), 5ull);
+
+  QVERIFY(staging.fileStart(3, 4));
+  QVERIFY(staging.write(3, "abcd") && staging.fileEnd(3));
+  QCOMPARE(staging.itemReceivedBytes(0), 9ull);
+  QCOMPARE(staging.itemReceivedBytes(4), 0ull);
+
+  QVERIFY(staging.fileStart(4, 6));
+  QVERIFY(staging.write(4, "123456") && staging.fileEnd(4));
+  QCOMPARE(staging.itemReceivedBytes(4), 6ull);
 }
 
 void FileDragTests::unpremultiplyRestoresStraightAlpha()

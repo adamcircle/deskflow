@@ -75,6 +75,10 @@ constexpr double kLauncherPressDelaySeconds = 0.03;
 constexpr double kNoPromiseTimeoutSeconds = 30.0;
 //! A promised item whose data stops arriving for this long fails the drag
 constexpr auto kStallTimeout = std::chrono::seconds(120);
+//! Drops larger than this (or containing any folder) publish Finder progress while arriving
+constexpr uint64_t kFinderProgressMinBytes = 50ull * 1024 * 1024;
+//! How often Finder progress is updated while bytes arrive (at most ~10 times per second)
+constexpr auto kProgressUpdateInterval = std::chrono::milliseconds(100);
 //! Image size of a dragged item, in points
 constexpr CGFloat kDragImageSide = 64;
 //! Pixel size of the icon sent to the other computer
@@ -699,6 +703,118 @@ void writePromise(
     StatePtr s, uint32_t dragId, uint32_t index, NSURL *url, void (^completion)(NSError *)
 );                                         // promise queue
 DestPtr findDest(StatePtr s, uint32_t id); // any thread
+
+int64_t toProgressUnits(uint64_t bytes)
+{
+  return static_cast<int64_t>(std::min<uint64_t>(bytes, static_cast<uint64_t>(INT64_MAX)));
+}
+
+bool shouldShowFinderProgress(const fd::FileDragStaging &staging)
+{
+  if (staging.totalBytes() > kFinderProgressMinBytes) {
+    return true;
+  }
+  return std::any_of(staging.entries().begin(), staging.entries().end(), [](const auto &entry) {
+    return entry.isDirectory;
+  });
+}
+
+//! Publishes Finder progress on a reserved placeholder while a promised item arrives
+struct FinderProgress
+{
+  uint32_t dragId = 0;
+  std::string displayName;
+  fs::path placeholder;
+  bool isDirectory = false;
+  bool hasPlaceholder = false;
+  NSProgress *progress = nil;
+  uint64_t lastReported = 0;
+
+  ~FinderProgress()
+  {
+    end("cancelled", true);
+  }
+
+  void begin(
+      const StatePtr &s, const DestPtr &session, uint32_t index, const fs::path &folder, const std::string &name,
+      bool directory
+  )
+  {
+    dragId = session->id;
+    isDirectory = directory;
+    std::string error;
+    if (!fd::FileDragStaging::reservePlaceholder(folder, name, directory, placeholder, &error)) {
+      LOG_WARN(
+          "file drag %u: cannot reserve \"%s\" in %s for Finder progress: %s", dragId, name.c_str(), folder.c_str(),
+          error.c_str()
+      );
+      return;
+    }
+    hasPlaceholder = true;
+    displayName = placeholder.filename().string();
+
+    const uint64_t total = session->staging.itemTotalBytes(index);
+    const uint64_t received = session->staging.itemReceivedBytes(index);
+    lastReported = received;
+
+    NSURL *itemUrl = [[NSURL fileURLWithPath:toNSString(placeholder.string())
+                                 isDirectory:directory] URLByStandardizingPath];
+    progress = [[NSProgress alloc] initWithParent:nil
+                                         userInfo:@{
+                                           NSProgressFileOperationKindKey : NSProgressFileOperationKindCopying,
+                                           NSProgressFileURLKey : itemUrl,
+                                         }];
+    progress.kind = NSProgressKindFile;
+    progress.totalUnitCount = toProgressUnits(total);
+    progress.completedUnitCount = toProgressUnits(received);
+    progress.cancellable = YES;
+    progress.pausable = NO;
+    WeakState weakState = s;
+    std::weak_ptr<DestSession> weakSession = session;
+    progress.cancellationHandler = ^{
+      auto st = weakState.lock();
+      auto sess = weakSession.lock();
+      if (st && sess) {
+        cancelSession(st, sess, fd::CancelReason::User, true);
+      }
+    };
+    [progress publish];
+    LOG_INFO(
+        "file drag %u: showing progress in Finder for \"%s\" (%llu bytes)", dragId, displayName.c_str(),
+        static_cast<unsigned long long>(total)
+    );
+  }
+
+  void update(uint64_t received)
+  {
+    if (progress == nil || received == lastReported) {
+      return;
+    }
+    lastReported = received;
+    progress.completedUnitCount = toProgressUnits(received);
+  }
+
+  void finishUnits()
+  {
+    if (progress != nil) {
+      progress.completedUnitCount = progress.totalUnitCount;
+    }
+  }
+
+  void end(const char *outcome, bool removeIfPlaceholder)
+  {
+    if (progress != nil) {
+      progress.cancellationHandler = nil;
+      [progress unpublish];
+      progress = nil;
+      LOG_INFO("file drag %u: Finder progress ended for \"%s\" (%s)", dragId, displayName.c_str(), outcome);
+    }
+    if (removeIfPlaceholder && hasPlaceholder) {
+      fd::FileDragStaging::removePlaceholder(placeholder, isDirectory);
+      hasPlaceholder = false;
+    }
+  }
+};
 
 } // namespace
 
@@ -1880,44 +1996,74 @@ void writePromise(StatePtr s, uint32_t dragId, uint32_t index, NSURL *url, void 
     s->sendPeer(fd::Message::dropped(session->id));
   }
 
-  // the data may still be on its way: wait for every byte of this item
   using WaitResult = fd::FileDragStaging::WaitResult;
-  auto lastBytes = session->staging.receivedBytes();
-  auto lastProgress = std::chrono::steady_clock::now();
-  auto result = WaitResult::Timeout;
-  while ((result = session->staging.waitForItem(index, std::chrono::milliseconds(500))) == WaitResult::Timeout) {
-    if (s->stopping) {
-      result = WaitResult::Failed;
-      break;
-    }
-    const auto bytes = session->staging.receivedBytes();
-    const auto now = std::chrono::steady_clock::now();
-    if (bytes != lastBytes) {
-      lastBytes = bytes;
-      lastProgress = now;
-    } else if (now - lastProgress > kStallTimeout) {
-      LOG_WARN("file drag %u: no data arrived for %lld s", dragId, static_cast<long long>(kStallTimeout.count()));
-      cancelSession(s, session, fd::CancelReason::Timeout, true);
-      result = WaitResult::Failed;
-      break;
-    }
-  }
-  if (result != WaitResult::Eof) {
-    completion(promiseError(@"The files did not arrive."));
-    cancelSession(s, session, session->cancelled ? session->reason.load() : fd::CancelReason::DropFailed, true);
-    return;
-  }
-
   // the receiver names the place; never replace what is there (a free "name (2)" instead)
   NSURL *folderUrl = url.URLByDeletingLastPathComponent;
   const char *folder = folderUrl.fileSystemRepresentation;
   NSString *wanted = url.lastPathComponent;
   const std::string name = wanted.length > 0 ? toUtf8(wanted) : entry.localPath;
+
+  // the data may still be on its way (all of it, from a source that waits for the drop): wait
+  // for every byte of this item, and let Finder show how far a large one is
+  FinderProgress finderProgress;
+  auto result = session->staging.waitForItem(index, std::chrono::milliseconds(0));
+  if (result == WaitResult::Timeout) {
+    if (!s->stopping && folder != nullptr && shouldShowFinderProgress(session->staging)) {
+      finderProgress.begin(s, session, index, fs::path(folder), name, entry.isDirectory);
+    }
+    const auto waitStep = finderProgress.progress != nil ? kProgressUpdateInterval : std::chrono::milliseconds(500);
+    auto lastBytes = session->staging.receivedBytes();
+    auto lastProgress = std::chrono::steady_clock::now();
+    while ((result = session->staging.waitForItem(index, waitStep)) == WaitResult::Timeout) {
+      if (s->stopping) {
+        result = WaitResult::Failed;
+        break;
+      }
+      finderProgress.update(session->staging.itemReceivedBytes(index));
+      const auto bytes = session->staging.receivedBytes();
+      const auto now = std::chrono::steady_clock::now();
+      if (bytes != lastBytes) {
+        lastBytes = bytes;
+        lastProgress = now;
+      } else if (now - lastProgress > kStallTimeout) {
+        LOG_WARN("file drag %u: no data arrived for %lld s", dragId, static_cast<long long>(kStallTimeout.count()));
+        cancelSession(s, session, fd::CancelReason::Timeout, true);
+        result = WaitResult::Failed;
+        break;
+      }
+    }
+  }
+  if (result != WaitResult::Eof || session->cancelled) {
+    const auto reason = session->cancelled ? session->reason.load() : fd::CancelReason::DropFailed;
+    finderProgress.end(session->cancelled ? fd::cancelReasonName(reason) : "failed", true);
+    NSError *err = (session->cancelled && reason == fd::CancelReason::User)
+                       ? [NSError errorWithDomain:NSCocoaErrorDomain code:NSUserCancelledError userInfo:nil]
+                       : promiseError(@"The files did not arrive.");
+    completion(err);
+    cancelSession(s, session, reason, true);
+    return;
+  }
+
   fs::path placed;
   std::string error;
-  if (folder == nullptr || !fd::FileDragStaging::moveNoReplace(
-                               session->staging.pathOf(index), fs::path(folder), name, entry.isDirectory, placed, &error
-                           )) {
+  bool ok = false;
+  if (finderProgress.hasPlaceholder) {
+    finderProgress.finishUnits();
+    ok = fd::FileDragStaging::replacePlaceholder(
+        session->staging.pathOf(index), finderProgress.placeholder, entry.isDirectory, placed, &error
+    );
+    if (ok) {
+      finderProgress.hasPlaceholder = false;
+      finderProgress.end("done", false);
+    } else {
+      finderProgress.end("failed", true);
+    }
+  } else if (folder != nullptr) {
+    ok = fd::FileDragStaging::moveNoReplace(
+        session->staging.pathOf(index), fs::path(folder), name, entry.isDirectory, placed, &error
+    );
+  }
+  if (!ok) {
     LOG_WARN(
         "file drag %u: cannot put \"%s\" into %s: %s", dragId, entry.localPath.c_str(),
         folder != nullptr ? folder : "?", error.c_str()

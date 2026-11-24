@@ -136,6 +136,10 @@ public:
     return m_totalBytes;
   }
   uint64_t receivedBytes() const;
+  //! Total bytes of top-level item \p top (for a folder: the sum of its files), or 0 if invalid
+  uint64_t itemTotalBytes(uint32_t top) const;
+  //! Bytes received so far for top-level item \p top, or 0 if invalid
+  uint64_t itemReceivedBytes(uint32_t top) const;
   const std::vector<Entry> &entries() const
   {
     return m_entries;
@@ -158,6 +162,32 @@ public:
       bool isDirectory, std::filesystem::path &placed, std::string *error = nullptr
   );
 
+  /**
+   * @brief Creates an empty file or folder in \p destinationDir under a free name
+   *
+   * Picks \p name, or "name (2).ext", "name (3).ext", ... and never replaces an existing
+   * file or folder. \p reserved receives the created path.
+   */
+  static bool reservePlaceholder(
+      const std::filesystem::path &destinationDir, const std::string &name, bool isDirectory,
+      std::filesystem::path &reserved, std::string *error = nullptr
+  );
+
+  /**
+   * @brief Replaces a placeholder from reservePlaceholder() with \p source
+   *
+   * Replaces \p placeholder atomically on the same volume, or copies into it across
+   * volumes. If \p placeholder vanished or is no longer empty, falls back to moveNoReplace()
+   * so nothing existing is ever replaced. \p placed receives the final path.
+   */
+  static bool replacePlaceholder(
+      const std::filesystem::path &source, const std::filesystem::path &placeholder, bool isDirectory,
+      std::filesystem::path &placed, std::string *error = nullptr
+  );
+
+  //! Removes an empty placeholder from reservePlaceholder(); never removes non-empty items or symlinks
+  static bool removePlaceholder(const std::filesystem::path &placeholder, bool isDirectory);
+
   //! Free bytes on the volume of \p path, or UINT64_MAX if unknown
   static uint64_t freeSpace(const std::filesystem::path &path);
 
@@ -171,6 +201,9 @@ private:
   struct FileState
   {
     uint64_t written = 0;
+    uint32_t topIndex = 0;    ///< owning top-level entry index
+    uint64_t itemTotal = 0;   ///< total bytes of this top-level item (on top-level entries)
+    uint64_t itemWritten = 0; ///< bytes received for this top-level item (on top-level entries)
     bool started = false;
     bool complete = false;
   };

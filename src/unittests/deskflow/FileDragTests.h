@@ -56,6 +56,8 @@ private Q_SLOTS:
   void moveIntoPlacesFilesAndFolders();
   void moveIntoNeverOverwrites();
   void moveNoReplacePicksFreeName();
+  void placeholderReservesReplacesAndNeverOverwrites();
+  void placeholderRemoveOnlyDeletesEmpty();
 
   // sending
   void scanBuildsParentsFirst();
@@ -86,6 +88,7 @@ private Q_SLOTS:
   void stagingWaitForItemCoversFolder();
   void stagingWaitForItemFailsOnCancel();
   void stagingWaitForItemRejectsNestedIndex();
+  void stagingTracksPerItemProgress();
 
   // drag image pixels
   void unpremultiplyRestoresStraightAlpha();
