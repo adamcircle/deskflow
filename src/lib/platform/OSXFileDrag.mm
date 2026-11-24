@@ -267,6 +267,10 @@ struct OSXFileDrag::State : public std::enable_shared_from_this<OSXFileDrag::Sta
   uint64_t scanGeneration = 0;
   uint64_t stripGeneration = 0;
   uint64_t parkGeneration = 0;
+  bool watching = false;       ///< the edge windows are up
+  unsigned watchEntered = 0;   ///< drags that reached an edge window during this watch
+  unsigned watchUpdated = 0;   ///< draggingUpdated calls on an edge window during this watch
+  bool catcherEntered = false; ///< the parked drag reached the catcher
 
   // secondary (destination) --------------------------------------------------------
   std::mutex destMutex;
@@ -369,6 +373,42 @@ void dispatchMainAfter(double seconds, dispatch_block_t block)
   dispatch_after(
       dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(seconds * NSEC_PER_SEC)), dispatch_get_main_queue(), block
   );
+}
+
+/**
+ * Level of a window that takes a drag. The system looks for the window under a drag below
+ * the drag image, which is a window at the dragging level: a window at or above that level
+ * (a screen saver level one, say) is never offered a drag. \p below is how many levels
+ * under the drag image the window goes; still above the Dock, the menu bar and menus.
+ */
+NSInteger levelBelowDragImage(int below)
+{
+  return CGWindowLevelForKey(kCGDraggingWindowLevelKey) - below;
+}
+
+//! Level of the edge windows
+NSInteger edgeWindowLevel()
+{
+  return levelBelowDragImage(2);
+}
+
+//! Level of the windows that hold or refuse a drag: above the edge windows
+NSInteger catcherWindowLevel()
+{
+  return levelBelowDragImage(1);
+}
+
+const char *activationPolicyName(NSApplicationActivationPolicy policy)
+{
+  switch (policy) {
+  case NSApplicationActivationPolicyRegular:
+    return "regular";
+  case NSApplicationActivationPolicyAccessory:
+    return "accessory";
+  case NSApplicationActivationPolicyProhibited:
+    return "prohibited";
+  }
+  return "?";
 }
 
 std::string toUtf8(NSString *s)
@@ -522,13 +562,14 @@ DestPtr findDest(StatePtr s, uint32_t id); // any thread
 
 //! Borderless, never key, on every Space (full screen ones too), above the Dock and menu bar
 @interface DFOverlayPanel : NSPanel
-- (instancetype)initWithView:(NSView *)view;
+- (instancetype)initWithView:(NSView *)view level:(NSInteger)level;
 - (void)placeAt:(const fd::EdgeRect &)rect;
+- (void)logAs:(const char *)what;
 @end
 
 @implementation DFOverlayPanel
 
-- (instancetype)initWithView:(NSView *)view
+- (instancetype)initWithView:(NSView *)view level:(NSInteger)level
 {
   self = [super initWithContentRect:NSMakeRect(0, 0, 4, 4)
                           styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
@@ -548,7 +589,7 @@ DestPtr findDest(StatePtr s, uint32_t id); // any thread
     self.hidesOnDeactivate = NO;
     self.becomesKeyOnlyIfNeeded = YES;
     // set last: floatingPanel and friends reset the level
-    self.level = NSScreenSaverWindowLevel;
+    self.level = level;
     self.animationBehavior = NSWindowAnimationBehaviorNone;
     self.ignoresMouseEvents = NO;
     self.contentView = view;
@@ -572,6 +613,22 @@ DestPtr findDest(StatePtr s, uint32_t id); // any thread
   self.alphaValue = 1.0;
   self.ignoresMouseEvents = NO;
   [self orderFrontRegardless];
+}
+
+- (void)logAs:(const char *)what
+{
+  // the window number tells whether a drag ever was over this window: the system log names the
+  // window under a drag (log show --predicate 'category == "coredraglistener"': "Drag did
+  // change target, pid=..., to=<window number>")
+  const NSRect f = self.frame;
+  NSString *screen = self.screen != nil ? self.screen.localizedName : @"none";
+  LOG_INFO(
+      "file drag: %s: window %ld, frame %.0f,%.0f %.0fx%.0f (from the bottom left), level %ld, visible %d, on the "
+      "active space %d, takes the pointer %d, screen \"%s\"",
+      what, static_cast<long>(self.windowNumber), f.origin.x, f.origin.y, f.size.width, f.size.height,
+      static_cast<long>(self.level), self.isVisible, self.isOnActiveSpace, !self.ignoresMouseEvents,
+      toUtf8(screen).c_str()
+  );
 }
 
 @end
@@ -607,9 +664,22 @@ DestPtr findDest(StatePtr s, uint32_t id); // any thread
   auto s = _state.lock();
   if (!s || _catcher) {
     // the parked local drag must never drop anything here
+    if (s && !s->catcherEntered) {
+      s->catcherEntered = true;
+      LOG_INFO(
+          "file drag: the parked drag is over the catcher (window %ld)", static_cast<long>(self.window.windowNumber)
+      );
+    }
     return NSDragOperationNone;
   }
   NSPasteboard *pasteboard = sender.draggingPasteboard;
+  ++s->watchEntered;
+  LOG_INFO(
+      "file drag: a drag entered edge window %ld (%lu types on its pasteboard, file URLs %s, source allows 0x%lx)",
+      static_cast<long>(self.window.windowNumber), static_cast<unsigned long>(pasteboard.types.count),
+      [pasteboard.types containsObject:NSPasteboardTypeFileURL] ? "yes" : "no",
+      static_cast<unsigned long>(sender.draggingSourceOperationMask)
+  );
   auto paths = filePathsOnPasteboard(pasteboard);
   _files = !paths.empty();
   if (!_files) {
@@ -624,7 +694,13 @@ DestPtr findDest(StatePtr s, uint32_t id); // any thread
 
 - (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender
 {
-  return (!_catcher && _files) ? (sender.draggingSourceOperationMask & NSDragOperationCopy) : NSDragOperationNone;
+  const NSDragOperation answer =
+      (!_catcher && _files) ? (sender.draggingSourceOperationMask & NSDragOperationCopy) : NSDragOperationNone;
+  if (auto s = _state.lock(); s && !_catcher && s->watchUpdated++ == 0) {
+    // once per watch: the drag stays over the edge window and is asked again as it moves
+    LOG_INFO("file drag: the drag moves over the edge window, answer 0x%lx", static_cast<unsigned long>(answer));
+  }
+  return answer;
 }
 
 - (void)draggingExited:(id<NSDraggingInfo>)sender
@@ -752,6 +828,7 @@ DestPtr findDest(StatePtr s, uint32_t id); // any thread
 @interface DFFileDragController : NSObject <NSDraggingSource, NSFilePromiseProviderDelegate>
 - (instancetype)initWithState:(const StatePtr &)state;
 - (void)placeStrips:(const std::vector<fd::EdgeRect> &)strips;
+- (void)logStrips;
 - (void)hideStrips;
 - (void)showCatcher:(const fd::EdgeRect &)rect;
 - (void)hideCatcher;
@@ -796,13 +873,22 @@ DestPtr findDest(StatePtr s, uint32_t id); // any thread
   }
   while (_strips.count < strips.size()) {
     DFDropView *view = [[DFDropView alloc] initWithState:s catcher:NO];
-    [_strips addObject:[[DFOverlayPanel alloc] initWithView:view]];
+    [_strips addObject:[[DFOverlayPanel alloc] initWithView:view level:edgeWindowLevel()]];
   }
   for (NSUInteger i = 0; i < _strips.count; ++i) {
     if (i < strips.size()) {
       [_strips[i] placeAt:strips[i]];
     } else {
       [_strips[i] orderOut:nil];
+    }
+  }
+}
+
+- (void)logStrips
+{
+  for (DFOverlayPanel *strip in _strips) {
+    if (strip.isVisible) {
+      [strip logAs:"edge window"];
     }
   }
 }
@@ -821,11 +907,13 @@ DestPtr findDest(StatePtr s, uint32_t id); // any thread
     return;
   }
   if (_catcher == nil) {
-    _catcher = [[DFOverlayPanel alloc] initWithView:[[DFDropView alloc] initWithState:s catcher:YES]];
     // above the edge windows, so the parked drag is over the catcher
-    _catcher.level = NSScreenSaverWindowLevel + 1;
+    _catcher = [[DFOverlayPanel alloc] initWithView:[[DFDropView alloc] initWithState:s catcher:YES]
+                                              level:catcherWindowLevel()];
   }
+  s->catcherEntered = false;
   [_catcher placeAt:rect];
+  [_catcher logAs:"catcher for the parked drag"];
 }
 
 - (void)hideCatcher
@@ -842,7 +930,9 @@ DestPtr findDest(StatePtr s, uint32_t id); // any thread
     return;
   }
   if (_launcher == nil) {
-    _launcher = [[DFOverlayPanel alloc] initWithView:[[DFLauncherView alloc] initWithState:s]];
+    // takes a press, not a drag: above everything, so nothing else gets the press
+    _launcher = [[DFOverlayPanel alloc] initWithView:[[DFLauncherView alloc] initWithState:s]
+                                               level:NSScreenSaverWindowLevel];
   }
   [_launcher placeAt:rect];
 }
@@ -865,8 +955,7 @@ DestPtr findDest(StatePtr s, uint32_t id); // any thread
 - (void)showRefuser:(const fd::EdgeRect &)rect
 {
   if (_refuser == nil) {
-    _refuser = [[DFOverlayPanel alloc] initWithView:[[DFRefuseView alloc] init]];
-    _refuser.level = NSScreenSaverWindowLevel + 1;
+    _refuser = [[DFOverlayPanel alloc] initWithView:[[DFRefuseView alloc] init] level:catcherWindowLevel()];
   }
   [_refuser placeAt:rect];
 }
@@ -1052,11 +1141,26 @@ void onFilesEntered(StatePtr s, std::vector<fs::path> paths, NSInteger changeCou
   });
 }
 
+//! What a watch that ended saw, so a drag that never reached the edge windows shows in the log
+void logWatchEnd(StatePtr s)
+{
+  if (!s->watching) {
+    return;
+  }
+  s->watching = false;
+  LOG_INFO(
+      "file drag: edge windows go (this watch: %u drags entered them, %u moves over them; this app is %s)",
+      s->watchEntered, s->watchUpdated,
+      NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier == getpid() ? "frontmost" : "in the background"
+  );
+}
+
 void watchEdgesMain(StatePtr s, uint32_t sides, const fd::EdgeRect &desktop)
 {
   DFFileDragController *c = controllerOf(s);
   const uint64_t generation = ++s->stripGeneration;
   if (sides == 0) {
+    logWatchEnd(s);
     if (s->overStrip && s->offered) {
       // the files are over an edge window and a hand-off usually follows at once: keep the
       // window under them until it does (the hand-off puts the catcher there first)
@@ -1077,8 +1181,22 @@ void watchEdgesMain(StatePtr s, uint32_t sides, const fd::EdgeRect &desktop)
     const auto part = fd::edgeStripsOnDisplays(side, sides, desktop, displays);
     strips.insert(strips.end(), part.begin(), part.end());
   }
-  LOG_DEBUG("file drag: %zu edge windows for sides 0x%x", strips.size(), sides);
   [c placeStrips:strips];
+
+  if (!s->watching) {
+    s->watching = true;
+    s->watchEntered = 0;
+    s->watchUpdated = 0;
+  }
+  const CGPoint cursor = currentCursor();
+  LOG_INFO(
+      "file drag: %zu edge windows for sides 0x%x (main thread %d, app %s, running %d, active %d, hidden %d; drag "
+      "image level %d; cursor %.0f,%.0f, left button %s)",
+      strips.size(), sides, pthread_main_np(), activationPolicyName(NSApp.activationPolicy), NSApp.isRunning,
+      NSApp.isActive, NSApp.isHidden, static_cast<int>(CGWindowLevelForKey(kCGDraggingWindowLevelKey)), cursor.x,
+      cursor.y, CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonLeft) ? "down" : "up"
+  );
+  [c logStrips];
 }
 
 void checkParkedButton(StatePtr s, uint64_t generation)
@@ -1165,6 +1283,7 @@ void handOffMain(StatePtr s, uint32_t dragId, int32_t parkX, int32_t parkY)
   const auto displays = activeDisplays();
   [c showCatcher:fd::squareAround(parkX, parkY, kCatcherSide, fd::displayAt(parkX, parkY, displays))];
   ++s->stripGeneration;
+  logWatchEnd(s);
   [c hideStrips];
   nudgeLocalDrag();
   s->parked = true;
