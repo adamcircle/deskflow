@@ -79,6 +79,10 @@ constexpr auto kStallTimeout = std::chrono::seconds(120);
 constexpr uint64_t kFinderProgressMinBytes = 50ull * 1024 * 1024;
 //! How often Finder progress is updated while bytes arrive (at most ~10 times per second)
 constexpr auto kProgressUpdateInterval = std::chrono::milliseconds(100);
+//! How often a parked drag that is not over the catcher yet is moved there again, and how many times
+constexpr CGKeyCode kEscapeKeyCode = 53;
+constexpr double kParkRetrySeconds = 0.03;
+constexpr int kParkTries = 10;
 //! Image size of a dragged item, in points
 constexpr CGFloat kDragImageSide = 64;
 //! Pixel size of the icon sent to the other computer
@@ -284,6 +288,9 @@ struct OSXFileDrag::State : public std::enable_shared_from_this<OSXFileDrag::Sta
   std::atomic<bool> parkedRelease{false};
   //! the cursor is on the other computer with a drag handed off (core thread writes, main thread reads)
   std::atomic<bool> away{false};
+  //! the parked local drag is over a window of this app, which refuses it: letting go of it
+  //! there drops nothing (main thread writes; core and event tap threads read)
+  std::atomic<bool> parkedOver{false};
   //! the computer the next drag goes to waits for the files until the drop (kCapLazy; core
   //! thread writes before each hand-off, main thread reads)
   std::atomic<bool> peerLazy{false};
@@ -315,6 +322,10 @@ struct OSXFileDrag::State : public std::enable_shared_from_this<OSXFileDrag::Sta
   unsigned watchEntered = 0;   ///< drags that reached an edge window during this watch
   unsigned watchUpdated = 0;   ///< draggingUpdated calls on an edge window during this watch
   bool catcherEntered = false; ///< the parked drag reached the catcher
+  bool stripsParked = false;   ///< the edge windows stay up under a parked drag
+  uint32_t parkedDragId = 0;
+  int32_t parkAtX = 0; ///< where the parked drag waits
+  int32_t parkAtY = 0;
   //! change count of the drag pasteboard last read ahead of the drag reaching an edge window
   NSInteger prebuiltChangeCount = -1;
   CFAbsoluteTime edgeReachedAt = 0; ///< when the files reached an edge window (timing in the log)
@@ -695,6 +706,7 @@ NSError *promiseError(NSString *what)
 void offerReady(StatePtr s);
 void offerLost(StatePtr s);
 void onFilesEntered(StatePtr s, std::vector<fs::path> paths, id<NSDraggingInfo> sender, NSView *view);
+void checkParked(StatePtr s, uint64_t generation, int attempt);
 void unpark(StatePtr s, const char *why);
 void startDrag(StatePtr s, DestPtr session, NSView *view, NSEvent *event);
 void loopEnded(StatePtr s, NSDragOperation operation);
@@ -943,12 +955,20 @@ struct FinderProgress
   auto s = _state.lock();
   if (!s || _catcher) {
     // the parked local drag must never drop anything here
+    if (s) {
+      s->parkedOver = true;
+    }
     if (s && !s->catcherEntered) {
       s->catcherEntered = true;
       LOG_INFO(
           "file drag: the parked drag is over the catcher (window %ld)", static_cast<long>(self.window.windowNumber)
       );
     }
+    return NSDragOperationNone;
+  }
+  if (s->parked) {
+    // the parked local drag is (back) at the edge: nothing is offered and nothing drops here
+    s->parkedOver = true;
     return NSDragOperationNone;
   }
   if (sender.draggingSource != nil) {
@@ -979,9 +999,14 @@ struct FinderProgress
 
 - (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender
 {
+  auto s = _state.lock();
+  if (s && s->parked) {
+    s->parkedOver = true;
+    return NSDragOperationNone;
+  }
   const NSDragOperation answer =
       (!_catcher && _files) ? (sender.draggingSourceOperationMask & NSDragOperationCopy) : NSDragOperationNone;
-  if (auto s = _state.lock(); s && !_catcher && s->watchUpdated++ == 0) {
+  if (s && !_catcher && s->watchUpdated++ == 0) {
     // once per watch: the drag stays over the edge window and is asked again as it moves
     LOG_INFO("file drag: the drag moves over the edge window, answer 0x%lx", static_cast<unsigned long>(answer));
   }
@@ -990,7 +1015,21 @@ struct FinderProgress
 
 - (void)draggingExited:(id<NSDraggingInfo>)sender
 {
-  [self dragLeft:"left the catcher"];
+  if (auto s = _state.lock(); s && s->parked) {
+    // a parked drag moves from the edge window to the catcher, or something moved it off
+    // the catcher: checkParked() puts it back
+    s->parkedOver = false;
+    if (_catcher) {
+      s->catcherEntered = false;
+      const uint64_t generation = s->parkGeneration;
+      dispatchMainAfter(kParkRetrySeconds, ^{
+        checkParked(s, generation, 0);
+      });
+    }
+    _files = NO;
+    return;
+  }
+  [self dragLeft:"left the edge window"];
 }
 
 - (BOOL)prepareForDragOperation:(id<NSDraggingInfo>)sender
@@ -1011,8 +1050,10 @@ struct FinderProgress
   if (!s) {
     return;
   }
-  if (_catcher) {
+  if (_catcher || s->parked) {
+    // the parked drag ended, over the catcher or over the edge window it was offered from
     unpark(s, why);
+    _files = NO;
     return;
   }
   if (_files) {
@@ -1499,6 +1540,9 @@ void watchEdgesMain(StatePtr s, uint32_t sides, const fd::EdgeRect &desktop)
   const uint64_t generation = ++s->stripGeneration;
   if (sides == 0) {
     logWatchEnd(s);
+    if (s->stripsParked) {
+      return; // they stay under the parked drag, see handOffMain()
+    }
     if (s->overStrip && s->offered) {
       // the files are over an edge window and a hand-off usually follows at once: keep the
       // window under them until it does (the hand-off puts the catcher there first)
@@ -1520,6 +1564,7 @@ void watchEdgesMain(StatePtr s, uint32_t sides, const fd::EdgeRect &desktop)
     strips.insert(strips.end(), part.begin(), part.end());
   }
   [c placeStrips:strips];
+  s->stripsParked = false;
 
   if (!s->watching) {
     s->watching = true;
@@ -1565,22 +1610,68 @@ void unpark(StatePtr s, const char *why)
     LOG_DEBUG("file drag: local drag released from the catcher: %s", why);
   }
   s->parked = false;
+  s->parkedOver = false;
   ++s->parkGeneration;
   [s->controller hideCatcher];
+  if (s->stripsParked) {
+    s->stripsParked = false;
+    [s->controller hideStrips];
+  }
 }
 
-//! Moves the cursor, and the local drag with it, to \p to; the drag then looks at what is under it (the catcher)
-void moveLocalDrag(CGPoint to)
+/**
+ * Moves the cursor, and the local drag with it, to where the drag is parked; the drag then
+ * looks at what is under it (the catcher). \p attempt varies how: the first try does not
+ * always reach the drag.
+ */
+void moveLocalDrag(StatePtr s, int attempt)
 {
-  // the warp makes no event of its own, and no motion reaches the drag while the cursor is
-  // on the other computer. The drag only looks for its window again when it has moved
-  CGWarpMouseCursorPosition(to);
+  // a drag only looks for the window under it when it moves: one point aside every other time
+  const CGPoint to = CGPointMake(s->parkAtX + (attempt % 2), s->parkAtY);
+  const CGPoint from = currentCursor();
+  if (std::abs(from.x - to.x) > 2 || std::abs(from.y - to.y) > 2) {
+    if (s->primary) {
+      // before the move, so no motion with the jump in it is missed
+      std::scoped_lock lock(s->parkJumpMutex);
+      s->parkJumpX = static_cast<int32_t>(std::lround(to.x - from.x));
+      s->parkJumpY = static_cast<int32_t>(std::lround(to.y - from.y));
+      s->parkJumped = s->parkJumpX != 0 || s->parkJumpY != 0;
+    }
+    // the warp makes no event of its own, and no motion reaches the drag while the cursor is
+    // on the other computer
+    CGWarpMouseCursorPosition(to);
+  }
   CGEventRef event = CGEventCreateMouseEvent(nullptr, kCGEventLeftMouseDragged, to, kCGMouseButtonLeft);
   if (event != nullptr) {
-    // posted after the HID event tap, so the core's own tap does not swallow it
-    CGEventPost(kCGSessionEventTap, event);
+    // marked as this app's own, so the core's event tap lets it pass; posted after that tap
+    // or, every other time, through it
+    CGEventSetIntegerValueField(event, kCGEventSourceUserData, OSXFileDrag::kEventTag);
+    CGEventPost(attempt % 2 == 0 ? kCGSessionEventTap : kCGHIDEventTap, event);
     CFRelease(event);
   }
+}
+
+void checkParked(StatePtr s, uint64_t generation, int attempt)
+{
+  if (!s->parked || !s->away || generation != s->parkGeneration || s->catcherEntered) {
+    return;
+  }
+  if (attempt >= kParkTries) {
+    LOG_WARN(
+        "file drag %u: the local drag does not reach the catcher; it %s", s->parkedDragId,
+        s->parkedOver ? "stays over the edge window, which refuses it too"
+                      : "ends with Escape when the button is let go"
+    );
+    return;
+  }
+  LOG_INFO(
+      "file drag %u: the local drag is not over the catcher yet, moving it there again (%d)", s->parkedDragId,
+      attempt + 1
+  );
+  moveLocalDrag(s, attempt + 1);
+  dispatchMainAfter(kParkRetrySeconds, ^{
+    checkParked(s, generation, attempt + 1);
+  });
 }
 
 void stopSourceSession(StatePtr s, uint32_t dragId)
@@ -1630,24 +1721,26 @@ void handOffMain(StatePtr s, uint32_t dragId, int32_t parkX, int32_t parkY)
   const int32_t x = clear.x + clear.w / 2;
   const int32_t y = clear.y + clear.h / 2;
   [c showCatcher:fd::squareAround(x, y, kCatcherSide, display)];
+  // the edge window stays under the drag for as long as it is parked: a drag that does not
+  // get to the catcher is still over a window that refuses it when the button is let go.
+  // Without it the app at the edge of the screen got the files then
+  s->parked = true;
+  s->parkedOver = s->overStrip;
+  s->stripsParked = true;
+  s->parkedDragId = dragId;
+  s->parkAtX = x;
+  s->parkAtY = y;
+  const uint64_t generation = ++s->parkGeneration;
+  ++s->stripGeneration;
+  logWatchEnd(s);
   if (s->away) {
     // not when the cursor already came back: it stays where the user has it
     LOG_INFO("file drag %u: the local drag waits at %d,%d (the cursor crossed at %d,%d)", dragId, x, y, parkX, parkY);
-    if (s->primary) {
-      // before the move, so no motion with the jump in it is missed
-      const CGPoint from = currentCursor();
-      std::scoped_lock lock(s->parkJumpMutex);
-      s->parkJumpX = x - static_cast<int32_t>(std::lround(from.x));
-      s->parkJumpY = y - static_cast<int32_t>(std::lround(from.y));
-      s->parkJumped = s->parkJumpX != 0 || s->parkJumpY != 0;
-    }
-    moveLocalDrag(CGPointMake(x, y));
+    moveLocalDrag(s, 0);
+    dispatchMainAfter(kParkRetrySeconds, ^{
+      checkParked(s, generation, 0);
+    });
   }
-  ++s->stripGeneration;
-  logWatchEnd(s);
-  [c hideStrips];
-  s->parked = true;
-  const uint64_t generation = ++s->parkGeneration;
   dispatchMainAfter(0.5, ^{
     checkParkedButton(s, generation);
   });
@@ -2377,6 +2470,24 @@ void OSXFileDrag::entered()
 bool OSXFileDrag::takeParkedRelease()
 {
   return m_state->parkedRelease.exchange(false);
+}
+
+bool OSXFileDrag::parkedDragIsCaught() const
+{
+  return m_state->parkedOver;
+}
+
+void OSXFileDrag::cancelLocalDrag()
+{
+  // Escape ends a drag without a drop. Posted after the core's event tap: it is this
+  // computer's, not a key for the computer the cursor is on
+  for (const bool down : {true, false}) {
+    if (CGEventRef key = CGEventCreateKeyboardEvent(nullptr, kEscapeKeyCode, down); key != nullptr) {
+      CGEventSetIntegerValueField(key, kCGEventSourceUserData, kEventTag);
+      CGEventPost(kCGSessionEventTap, key);
+      CFRelease(key);
+    }
+  }
 }
 
 void OSXFileDrag::removeParkJump(int32_t &dx, int32_t &dy)

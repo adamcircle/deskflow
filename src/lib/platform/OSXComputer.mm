@@ -64,7 +64,9 @@ static const double kCarbonLoopWaitTimeout = 10.0;
 
 // file drag: marks our own mouse events on the server (kCGEventSourceUserData), which the
 // event tap lets through without reporting them as the user's
-static const int64_t kFileDragEventTag = 0x44464644; // "DFFD"
+static const int64_t kFileDragEventTag = OSXFileDrag::kEventTag;
+// file drag: how long after the Escape that ends a local drag the button is let go
+static const double kFileDragCancelDelay = 0.05;
 
 // Synthetic mouse button and drag events require event numbers on macOS 27 and later.
 static inline bool needsEventNumber()
@@ -521,6 +523,12 @@ void OSXComputer::postMouseEvent(CGPoint &pos) const
 
 void OSXComputer::fakeMouseButton(ButtonID id, bool press)
 {
+  if (!m_isPrimary && !press && id == kButtonLeft && m_fileDragParkedId != 0) {
+    // file drag: the drag parked here must not end over an app's window
+    fileDragReleaseParked("the server let go of the button");
+    return;
+  }
+
   // Buttons are indexed from one, but the button down array is indexed from zero
   uint32_t index = mapDeskflowButtonToMac(id) - kButtonLeft;
   if (index >= NumButtonIDs) {
@@ -1727,8 +1735,10 @@ CGEventRef OSXComputer::handleCGInputEvent(CGEventTapProxy proxy, CGEventType ty
   case kCGEventLeftMouseUp:
   case kCGEventLeftMouseDragged:
   case kCGEventMouseMoved:
+  case kCGEventKeyDown:
+  case kCGEventKeyUp:
     if (CGEventGetIntegerValueField(event, kCGEventSourceUserData) == kFileDragEventTag) {
-      // file drag: our own press, release or move for a drag shown here (not the user's)
+      // file drag: our own press, release, move or Escape for a drag on this computer (not the user's)
       return event;
     }
     break;
@@ -1800,7 +1810,21 @@ CGEventRef OSXComputer::handleCGInputEvent(CGEventTapProxy proxy, CGEventType ty
     // file drag: the local drag waiting over the catcher ends with this release. It is
     // relayed as usual and also reaches this computer once, where the catcher refuses the
     // drop, so nothing is moved or copied here.
-    return event;
+    if (computer->m_fileDrag->parkedDragIsCaught()) {
+      return event;
+    }
+    // the drag is over a window of some app, which would take the files: end it without a
+    // drop first. The release follows as an event of our own, so it comes after the Escape
+    LOG_WARN("file drag: the local drag is not over the catcher, ending it with Escape and not with the release");
+    OSXFileDrag::cancelLocalDrag();
+    const CGPoint at = CGEventGetLocation(event);
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(kFileDragCancelDelay * NSEC_PER_SEC)),
+        dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+          postFileDragButton(false, static_cast<int32_t>(at.x), static_cast<int32_t>(at.y));
+        }
+    );
+    return nullptr;
   }
   return nullptr;
 }
@@ -1945,6 +1969,13 @@ void OSXComputer::fileDragReleaseParked(const char *why)
     // the cursor is away, over the catcher, which takes nothing: the drag ends here
     // without moving or copying anything on this computer
     LOG_INFO("file drag %u: letting go of the drag parked here (%s)", id, why);
+    if (m_fileDrag && !m_fileDrag->parkedDragIsCaught()) {
+      // the drag is over a window of some app, which would take the files: end it without
+      // a drop before the button goes up
+      LOG_WARN("file drag %u: the local drag is not over the catcher, ending it with Escape first", id);
+      OSXFileDrag::cancelLocalDrag();
+      Arch::sleep(kFileDragCancelDelay);
+    }
     // the hand-off moved the cursor to the catcher: let go where it is now
     m_cursorPosValid = false;
     fakeMouseButton(kButtonLeft, false);

@@ -850,7 +850,7 @@ void Client::fileDragHandOff(uint32_t dragId)
     m_server->fileDragSend(Message::cancel(dragId, CancelReason::Unsupported));
     return;
   }
-  LOG_INFO("file drag %u: the cursor takes the files to the server; parking the drag here and sending them", dragId);
+  LOG_INFO("file drag %u: the cursor takes the files to the server; parking the drag here", dragId);
   m_fileDragOutId = dragId;
   if ((m_computer->fileDragCapabilities() & deskflow::filedrag::kCapLazy) != 0) {
     // the platform keeps the files back until the drop if the server can wait for them
@@ -877,7 +877,7 @@ bool Client::fileDragReceiveOutgoing(const Message &message)
     return true;
 
   case Dropped:
-    LOG_INFO("file drag %u: dropped on the server, still sending the files", message.dragId);
+    LOG_INFO("file drag %u: dropped on the server", message.dragId);
     m_computer->fileDragReceive(message);
     return true;
 
@@ -1015,7 +1015,7 @@ void Client::handleFileDragEvent(const Event &event)
       m_fileDragLooping = false;
     }
     if (message.type == Message::Type::Begin) {
-      LOG_INFO("file drag %u: sending %zu items to the server", message.dragId, message.items.size());
+      LOG_INFO("file drag %u: the server now knows the %zu items", message.dragId, message.items.size());
     }
     if (message.type == Message::Type::Cancel && message.dragId != 0 && message.dragId == m_fileDragOutId) {
       LOG_INFO(

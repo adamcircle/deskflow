@@ -85,6 +85,16 @@ public:
    */
   bool takeParkedRelease();
   /**
+   * Any thread: true if the parked local drag is over a window of this app, which refuses it.
+   * Letting go of the button then drops nothing. If not, end the drag with cancelLocalDrag()
+   * first: the window under it could take the files.
+   */
+  bool parkedDragIsCaught() const;
+  //! Ends the drag that is running on this computer without a drop (Escape)
+  static void cancelLocalDrag();
+  //! Marks the mouse and key events this code posts (kCGEventSourceUserData): not the user's
+  static constexpr int64_t kEventTag = 0x44464644; // "DFFD"
+  /**
    * Event tap thread (server only): takes the jump that parking the local drag put into the
    * mouse motion out of \p dx, \p dy. Moving the cursor adds the distance to the motion
    * reported after it, which would otherwise count as the user moving back to this computer.
