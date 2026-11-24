@@ -47,6 +47,8 @@ enum Capability : uint32_t
   /// drag that is cancelled or goes back never copies anything. Peers without it get the
   /// files from the hand-off on, as before.
   kCapLazy = 1u << 3,
+  //! Shows a picture of the whole drag at the size it says (setIconPointWidth()), centred on the cursor
+  kCapPreview = 1u << 4,
 };
 
 //! True if a source with \p sourceCaps keeps its files back until the drop on a destination with \p destinationCaps
@@ -113,7 +115,12 @@ struct Item
 
 using ItemList = std::vector<Item>;
 
-//! Drag image: RGBA8, straight alpha, top row first
+/**
+ * @brief Drag image: RGBA8, straight alpha, top row first
+ *
+ * Without a point width (iconPointWidth()) it is the icon of the first item. With one it is a
+ * picture of the whole drag with the cursor at its centre, for a peer with kCapPreview only.
+ */
 struct Icon
 {
   uint16_t width = 0;

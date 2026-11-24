@@ -680,4 +680,29 @@ void unpremultiplyRgba(std::string &rgba)
   }
 }
 
+namespace {
+//! Red of a fully transparent first pixel that carries the point width in green and blue
+constexpr uint8_t kIconPointWidthMark = 0xDF;
+} // namespace
+
+void setIconPointWidth(Icon &icon, uint16_t points)
+{
+  if (icon.isEmpty() || !icon.isValid() || points == 0) {
+    return;
+  }
+  icon.rgba[0] = static_cast<char>(kIconPointWidthMark);
+  icon.rgba[1] = static_cast<char>(points >> 8);
+  icon.rgba[2] = static_cast<char>(points & 0xff);
+  icon.rgba[3] = 0;
+}
+
+uint16_t iconPointWidth(const Icon &icon)
+{
+  if (icon.isEmpty() || !icon.isValid() || static_cast<uint8_t>(icon.rgba[0]) != kIconPointWidthMark ||
+      icon.rgba[3] != 0) {
+    return 0;
+  }
+  return static_cast<uint16_t>((static_cast<uint8_t>(icon.rgba[1]) << 8) | static_cast<uint8_t>(icon.rgba[2]));
+}
+
 } // namespace deskflow::filedrag

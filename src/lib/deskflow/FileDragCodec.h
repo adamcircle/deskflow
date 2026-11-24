@@ -142,4 +142,16 @@ bool decodeMessage(std::string_view encoded, Message &message, std::string *erro
  */
 void unpremultiplyRgba(std::string &rgba);
 
+/**
+ * @brief Marks \p icon as a picture of the whole drag that is \p points wide on screen
+ *
+ * The message that carries an icon has no field for this, so it is written into the first
+ * pixel, which is made fully transparent (it is a corner of a picture with the cursor at its
+ * centre). The height follows from the picture's proportions.
+ */
+void setIconPointWidth(Icon &icon, uint16_t points);
+
+//! Width on screen that setIconPointWidth() gave \p icon, in points; 0 if it gave none
+uint16_t iconPointWidth(const Icon &icon);
+
 } // namespace deskflow::filedrag

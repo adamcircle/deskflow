@@ -1463,6 +1463,35 @@ void FileDragTests::unpremultiplyRestoresStraightAlpha()
   QCOMPARE(px(17), 2);
 }
 
+void FileDragTests::iconCarriesItsPointWidth()
+{
+  // an icon as older peers send it says nothing about its size
+  Icon icon{2, 1, std::string(8, '\x7f')};
+  QCOMPARE(iconPointWidth(icon), uint16_t{0});
+  Icon transparent{2, 1, std::string(8, '\0')};
+  QCOMPARE(iconPointWidth(transparent), uint16_t{0});
+
+  setIconPointWidth(icon, 341);
+  QVERIFY(icon.isValid());
+  QCOMPARE(iconPointWidth(icon), uint16_t{341});
+  QCOMPARE(icon.rgba[3], '\0');                          // the pixel that says so shows nothing
+  QCOMPARE(icon.rgba.substr(4), std::string(4, '\x7f')); // and no other pixel changed
+
+  // and survives the wire
+  Message message;
+  message.type = Message::Type::Icon;
+  message.dragId = 7;
+  message.icon = icon;
+  Message decoded;
+  QVERIFY(decodeMessage(encodeMessage(message), decoded));
+  QCOMPARE(iconPointWidth(decoded.icon), uint16_t{341});
+
+  Icon empty;
+  setIconPointWidth(empty, 100);
+  QVERIFY(empty.isEmpty());
+  QCOMPARE(iconPointWidth(empty), uint16_t{0});
+}
+
 //
 // client to server
 //

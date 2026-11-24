@@ -822,7 +822,7 @@ uint32_t Client::fileDragCapabilities() const
     caps |= kCapSource | kCapReverse;
   }
   // how the files travel is the platform's business
-  caps |= platform & kCapLazy;
+  caps |= platform & (kCapLazy | kCapPreview);
   return caps;
 }
 

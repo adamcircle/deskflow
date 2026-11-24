@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -78,6 +79,10 @@ constexpr auto kStallTimeout = std::chrono::seconds(120);
 constexpr CGFloat kDragImageSide = 64;
 //! Pixel size of the icon sent to the other computer
 constexpr int kIconPixels = 96;
+//! Pixels per point of a picture of the whole drag, if it fits fd::kMaxIconSide like that
+constexpr CGFloat kPreviewPixelsPerPoint = kIconPixels / kDragImageSide;
+//! A larger drag gets a coarser picture, down to this; what is farther from the cursor is cut off
+constexpr CGFloat kPreviewMinPixelsPerPoint = 0.75;
 
 enum class DestPhase : int
 {
@@ -278,6 +283,8 @@ struct OSXFileDrag::State : public std::enable_shared_from_this<OSXFileDrag::Sta
   //! the computer the next drag goes to waits for the files until the drop (kCapLazy; core
   //! thread writes before each hand-off, main thread reads)
   std::atomic<bool> peerLazy{false};
+  //! that computer shows a picture of the whole drag (kCapPreview; same threads)
+  std::atomic<bool> peerPreview{false};
   //! parking the drag moved the cursor by parkJumpX, parkJumpY; the mouse motion after it
   //! still contains that distance (main thread writes, event tap thread takes it)
   std::atomic<bool> parkJumped{false};
@@ -292,6 +299,8 @@ struct OSXFileDrag::State : public std::enable_shared_from_this<OSXFileDrag::Sta
 
   // main thread only
   std::shared_ptr<Offer> offer;
+  NSInteger previewSequence = -1; ///< the drag (its dragging sequence number) that preview shows
+  fd::Icon preview;               ///< what the drag at the edge window looks like; empty if unknown
   bool overStrip = false;
   bool offered = false;
   bool parked = false;
@@ -488,37 +497,134 @@ std::vector<fs::path> filePathsOnPasteboard(NSPasteboard *pasteboard)
   return paths;
 }
 
-//! Drag image of a file or folder, RGBA with straight alpha (as the wire carries it)
-fd::Icon iconForPath(const fs::path &path)
+//! Draw into the straight-alpha, top-row-first bitmap used by the Icon message
+fd::Icon renderIcon(uint16_t width, uint16_t height, void (^draw)(CGContextRef))
 {
-  fd::Icon icon;
-  NSImage *image = [[NSWorkspace sharedWorkspace] iconForFile:toNSString(path.string())];
-  if (image == nil) {
-    return icon;
-  }
-  NSRect rect = NSMakeRect(0, 0, kIconPixels, kIconPixels);
-  CGImageRef cgImage = [image CGImageForProposedRect:&rect context:nil hints:nil];
-  if (cgImage == nullptr) {
-    return icon;
-  }
-  std::string rgba(static_cast<size_t>(kIconPixels) * kIconPixels * 4, '\0');
+  std::string rgba(static_cast<size_t>(width) * height * 4, '\0');
   CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
   CGContextRef context = CGBitmapContextCreate(
-      rgba.data(), kIconPixels, kIconPixels, 8, kIconPixels * 4, space,
+      rgba.data(), width, height, 8, width * 4, space,
       static_cast<uint32_t>(kCGImageAlphaPremultipliedLast) | static_cast<uint32_t>(kCGBitmapByteOrder32Big)
   );
   CGColorSpaceRelease(space);
   if (context == nullptr) {
-    return icon;
+    return {};
   }
   CGContextSetInterpolationQuality(context, kCGInterpolationHigh);
-  CGContextDrawImage(context, CGRectMake(0, 0, kIconPixels, kIconPixels), cgImage);
+  draw(context);
   CGContextRelease(context);
-  // bitmap contexts are premultiplied and keep the top row first in memory
   fd::unpremultiplyRgba(rgba);
-  icon.width = kIconPixels;
-  icon.height = kIconPixels;
-  icon.rgba = std::move(rgba);
+  return {width, height, std::move(rgba)};
+}
+
+//! Drag image of a file or folder, RGBA with straight alpha (as the wire carries it)
+fd::Icon iconForPath(const fs::path &path)
+{
+  NSImage *image = [[NSWorkspace sharedWorkspace] iconForFile:toNSString(path.string())];
+  if (image == nil) {
+    return {};
+  }
+  NSRect rect = NSMakeRect(0, 0, kIconPixels, kIconPixels);
+  CGImageRef cgImage = [image CGImageForProposedRect:&rect context:nil hints:nil];
+  if (cgImage == nullptr) {
+    return {};
+  }
+  return renderIcon(kIconPixels, kIconPixels, ^(CGContextRef context) {
+    CGContextDrawImage(context, CGRectMake(0, 0, kIconPixels, kIconPixels), cgImage);
+  });
+}
+
+/**
+ * What the drag over \p view looks like, as a picture with the cursor at its centre (the
+ * margins that takes are transparent), marked with its width in points. Empty if the drag
+ * shows no images or drawing them takes too long.
+ */
+fd::Icon captureDragImage(id<NSDraggingInfo> sender, NSView *view, NSUInteger &itemCount)
+{
+  const NSPoint cursor = [view convertPoint:sender.draggingLocation fromView:nil];
+  struct Layer
+  {
+    NSImage *image;
+    NSRect frame;
+  };
+  __block std::vector<Layer> layers;
+  __block NSRect bounds = NSZeroRect;
+  // Finish small stacks even if AppKit is warming up. For large drags, check the budget between items and layers.
+  constexpr size_t kSmallStack = 8;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(25);
+  __block bool timedOut = false;
+  [sender enumerateDraggingItemsWithOptions:0
+      forView:view
+      classes:@[ NSPasteboardItem.class, NSURL.class ]
+      searchOptions:@{}
+      usingBlock:^(NSDraggingItem *item, NSInteger index, BOOL *stop) {
+        if (index >= static_cast<NSInteger>(kSmallStack) && std::chrono::steady_clock::now() >= deadline) {
+          timedOut = true;
+          *stop = YES;
+          return;
+        }
+        const NSRect frame = item.draggingFrame;
+        if (NSIsEmptyRect(frame)) {
+          return;
+        }
+        const auto before = layers.size();
+        for (NSDraggingImageComponent *component in item.imageComponents) {
+          const NSRect r = NSOffsetRect(component.frame, frame.origin.x, frame.origin.y);
+          if (NSIsEmptyRect(r) || !std::isfinite(NSMinX(r)) || !std::isfinite(NSMaxX(r)) || !std::isfinite(NSMinY(r)) ||
+              !std::isfinite(NSMaxY(r))) {
+            continue;
+          }
+          id contents = component.contents;
+          NSImage *image = nil;
+          if ([contents isKindOfClass:NSImage.class]) {
+            image = contents;
+          } else if (contents && CFGetTypeID((__bridge CFTypeRef)contents) == CGImageGetTypeID()) {
+            image = [[NSImage alloc] initWithCGImage:(__bridge CGImageRef)contents size:r.size];
+          }
+          if (image != nil) {
+            bounds = NSUnionRect(bounds, r);
+            layers.push_back({image, r});
+          }
+        }
+        if (layers.size() > before) {
+          ++itemCount;
+        }
+      }];
+  if (layers.empty() || timedOut) {
+    return {};
+  }
+  const CGFloat w = 2 * std::max(cursor.x - NSMinX(bounds), NSMaxX(bounds) - cursor.x);
+  const CGFloat h = 2 * std::max(cursor.y - NSMinY(bounds), NSMaxY(bounds) - cursor.y);
+  if (!(w > 0 && h > 0 && std::isfinite(w) && std::isfinite(h))) {
+    return {};
+  }
+  const CGFloat scale =
+      std::clamp(fd::kMaxIconSide / std::max(w, h), kPreviewMinPixelsPerPoint, kPreviewPixelsPerPoint);
+  const auto pixels = [scale](CGFloat points) {
+    return static_cast<uint16_t>(std::clamp<CGFloat>(std::ceil(points * scale), 1, fd::kMaxIconSide));
+  };
+  const uint16_t width = pixels(w);
+  const uint16_t height = pixels(h);
+  auto icon = renderIcon(width, height, ^(CGContextRef context) {
+    CGContextTranslateCTM(context, width / 2.0, height / 2.0);
+    CGContextScaleCTM(context, scale, scale);
+    CGContextTranslateCTM(context, -cursor.x, -cursor.y);
+    [NSGraphicsContext saveGraphicsState];
+    NSGraphicsContext.currentContext = [NSGraphicsContext graphicsContextWithCGContext:context flipped:NO];
+    for (size_t i = 0; i < layers.size(); ++i) {
+      if (i >= kSmallStack && std::chrono::steady_clock::now() >= deadline) {
+        timedOut = true;
+        break;
+      }
+      const auto &layer = layers[i];
+      [layer.image drawInRect:layer.frame fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1.0];
+    }
+    [NSGraphicsContext restoreGraphicsState];
+  });
+  if (timedOut) {
+    return {};
+  }
+  fd::setIconPointWidth(icon, static_cast<uint16_t>(std::lround(width / scale)));
   return icon;
 }
 
@@ -543,7 +649,13 @@ NSImage *imageFromIcon(const fd::Icon &icon)
     return nil;
   }
   memcpy(rep.bitmapData, icon.rgba.data(), static_cast<size_t>(icon.width) * icon.height * 4);
-  NSImage *image = [[NSImage alloc] initWithSize:NSMakeSize(kDragImageSide, kDragImageSide * icon.height / icon.width)];
+  NSSize size = NSMakeSize(kDragImageSide, kDragImageSide);
+  if (const uint16_t points = fd::iconPointWidth(icon); points > 0) {
+    // a picture of the whole drag: as large as on the computer it comes from
+    size = NSMakeSize(points, static_cast<CGFloat>(points) * icon.height / icon.width);
+    memset(rep.bitmapData, 0, 4); // the pixel that says so
+  }
+  NSImage *image = [[NSImage alloc] initWithSize:size];
   [image addRepresentation:rep];
   return image;
 }
@@ -578,7 +690,7 @@ NSError *promiseError(NSString *what)
 // forward declarations (main thread unless noted)
 void offerReady(StatePtr s);
 void offerLost(StatePtr s);
-void onFilesEntered(StatePtr s, std::vector<fs::path> paths, NSInteger changeCount);
+void onFilesEntered(StatePtr s, std::vector<fs::path> paths, id<NSDraggingInfo> sender, NSView *view);
 void unpark(StatePtr s, const char *why);
 void startDrag(StatePtr s, DestPtr session, NSView *view, NSEvent *event);
 void loopEnded(StatePtr s, NSDragOperation operation);
@@ -745,7 +857,7 @@ DestPtr findDest(StatePtr s, uint32_t id); // any thread
     return NSDragOperationNone;
   }
   LOG_INFO("a drag of %zu files or folders reached the edge window", paths.size());
-  onFilesEntered(s, std::move(paths), pasteboard.changeCount);
+  onFilesEntered(s, std::move(paths), sender, self);
   return sender.draggingSourceOperationMask & NSDragOperationCopy;
 }
 
@@ -1204,11 +1316,29 @@ void prepareOffer(StatePtr s, std::vector<fs::path> paths, NSInteger changeCount
 }
 
 //! A drag of files reached an edge window: offer them as soon as their item list is built
-void onFilesEntered(StatePtr s, std::vector<fs::path> paths, NSInteger changeCount)
+void onFilesEntered(StatePtr s, std::vector<fs::path> paths, id<NSDraggingInfo> sender, NSView *view)
 {
   s->overStrip = true;
   s->edgeReachedAt = CFAbsoluteTimeGetCurrent();
-  prepareOffer(s, std::move(paths), changeCount);
+  prepareOffer(s, std::move(paths), sender.draggingPasteboard.changeCount);
+
+  // what the drag looks like, once per drag: a computer with kCapPreview shows the same under
+  // its cursor. The hand-off comes after this, on this thread
+  if (s->previewSequence != sender.draggingSequenceNumber) {
+    const auto started = std::chrono::steady_clock::now();
+    NSUInteger items = 0;
+    s->preview = captureDragImage(sender, view, items);
+    s->previewSequence = sender.draggingSequenceNumber;
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    if (s->preview.isEmpty()) {
+      LOG_INFO("file drag: the drag shows no image to copy, the file's icon stands for it (%.1f ms)", ms);
+    } else {
+      LOG_INFO(
+          "file drag: drag image captured: %ux%u px, %u points wide, from %lu items in %.1f ms", s->preview.width,
+          s->preview.height, fd::iconPointWidth(s->preview), static_cast<unsigned long>(items), ms
+      );
+    }
+  }
 }
 
 /**
@@ -1426,11 +1556,13 @@ void handOffMain(StatePtr s, uint32_t dragId, int32_t parkX, int32_t parkY)
   } else {
     LOG_INFO("file drag %u: sending %zu items", dragId, offer.items.size());
   }
-  if (!offer.icon.isEmpty()) {
+  // a picture of the whole drag for a computer that shows one, else the first file's icon
+  const bool preview = s->peerPreview && !s->preview.isEmpty();
+  if (preview || !offer.icon.isEmpty()) {
     fd::Message icon;
     icon.type = fd::Message::Type::Icon;
     icon.dragId = dragId;
-    icon.icon = offer.icon;
+    icon.icon = preview ? s->preview : offer.icon;
     s->sendPeer(icon);
   }
   fd::Message begin;
@@ -1640,6 +1772,8 @@ void startDrag(StatePtr s, DestPtr session, NSView *view, NSEvent *event)
   }
   const auto &entries = session->staging.entries();
   NSImage *image = imageFromIcon(icon);
+  // a picture of the whole drag is shown once, as it is; an icon stands for the first item
+  const bool preview = image != nil && fd::iconPointWidth(icon) > 0;
 
   const NSPoint at = [view convertPoint:event.locationInWindow fromView:nil];
   NSMutableArray<NSDraggingItem *> *items = [NSMutableArray array];
@@ -1650,11 +1784,11 @@ void startDrag(StatePtr s, DestPtr session, NSView *view, NSEvent *event)
                                                                              delegate:c];
     provider.userInfo = @{@"drag" : @(session->id), @"index" : @(top)};
     NSDraggingItem *item = [[NSDraggingItem alloc] initWithPasteboardWriter:provider];
-    NSImage *contents = (n == 0 && image != nil) ? image : placeholderImage(entry.isDirectory);
-    const CGFloat offset = std::min(n, 3) * 4.0;
+    NSImage *contents = (n == 0 && image != nil) ? image : (preview ? nil : placeholderImage(entry.isDirectory));
+    const NSSize size = preview ? image.size : NSMakeSize(kDragImageSide, kDragImageSide);
+    const CGFloat offset = preview ? 0 : std::min(n, 3) * 4.0;
     [item setDraggingFrame:NSMakeRect(
-                               at.x - kDragImageSide / 2 + offset, at.y - kDragImageSide / 2 - offset, kDragImageSide,
-                               kDragImageSide
+                               at.x - size.width / 2 + offset, at.y - size.height / 2 - offset, size.width, size.height
                            )
                   contents:contents];
     [items addObject:item];
@@ -1674,7 +1808,14 @@ void startDrag(StatePtr s, DestPtr session, NSView *view, NSEvent *event)
     return;
   }
   drag.animatesToStartingPositionsOnCancelOrFail = NO;
-  drag.draggingFormation = NSDraggingFormationPile;
+  drag.draggingFormation = preview ? NSDraggingFormationNone : NSDraggingFormationPile;
+  if (preview) {
+    drag.draggingLeaderIndex = 0;
+    LOG_INFO(
+        "file drag %u: the drag looks as on the other computer (%ux%u px shown %.0f x %.0f points around the cursor)",
+        session->id, icon.width, icon.height, image.size.width, image.size.height
+    );
+  }
   LOG_INFO(
       "file drag %u: the drag runs (%lu items, %.0f ms after they were announced)", session->id,
       static_cast<unsigned long>(items.count), (CFAbsoluteTimeGetCurrent() - session->begunAt) * 1000.0
@@ -2023,7 +2164,7 @@ uint32_t OSXFileDrag::capabilities() const
     return fd::kCapNone;
   }
   // both roles, and the client to server messages (kMsgDFileDragWatch, Offer, HandOff)
-  return fd::kCapSource | fd::kCapDestination | fd::kCapReverse | fd::kCapLazy;
+  return fd::kCapSource | fd::kCapDestination | fd::kCapReverse | fd::kCapLazy | fd::kCapPreview;
 }
 
 void OSXFileDrag::watchEdges(uint32_t sideMask, int32_t x, int32_t y, int32_t w, int32_t h)
@@ -2141,6 +2282,7 @@ void OSXFileDrag::receive(const fd::Message &message)
   case Caps:
     // not from the wire: the flags of the computer the next drag goes to (see handOff())
     s->peerLazy = fd::lazyTransferAvailable(capabilities(), message.flags);
+    s->peerPreview = (message.flags & fd::kCapPreview) != 0;
     return;
   case Dropped: {
     // a destination that waits for the files (kCapLazy) asks for them with this

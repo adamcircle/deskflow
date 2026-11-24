@@ -89,6 +89,7 @@ private Q_SLOTS:
 
   // drag image pixels
   void unpremultiplyRestoresStraightAlpha();
+  void iconCarriesItsPointWidth();
 
   // client to server: crossing the client's edge with a held button
   void switchFromClientWithHeldButton_data();
