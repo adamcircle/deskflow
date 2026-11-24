@@ -64,6 +64,8 @@ namespace {
 constexpr int32_t kLauncherSide = 64;
 //! Side of the window that holds a parked local drag on the primary
 constexpr int32_t kCatcherSide = 160;
+//! How far from the edges of its display a local drag is parked (clear of the Dock)
+constexpr int32_t kParkInset = 200;
 //! How long the start window waits for its button press
 constexpr double kLauncherTimeoutSeconds = 5.0;
 //! Delay between showing the start window and pressing on it
@@ -253,6 +255,8 @@ struct OSXFileDrag::State : public std::enable_shared_from_this<OSXFileDrag::Sta
   // primary (source) ---------------------------------------------------------------
   //! the next left button release passes to the system (core and event tap threads)
   std::atomic<bool> parkedRelease{false};
+  //! the cursor is on the other computer with a drag handed off (core thread writes, main thread reads)
+  std::atomic<bool> away{false};
   //! the drag that is being handed off or sent (core thread writes, main thread reads)
   std::atomic<uint32_t> currentDragId{0};
 
@@ -1247,11 +1251,13 @@ void unpark(StatePtr s, const char *why)
   [s->controller hideCatcher];
 }
 
-//! Makes the local drag look at what is under it again (the catcher), without moving it
-void nudgeLocalDrag()
+//! Moves the cursor, and the local drag with it, to \p to; the drag then looks at what is under it (the catcher)
+void moveLocalDrag(CGPoint to)
 {
-  const CGPoint at = currentCursor();
-  CGEventRef event = CGEventCreateMouseEvent(nullptr, kCGEventLeftMouseDragged, at, kCGMouseButtonLeft);
+  // the warp makes no event of its own, and no motion reaches the drag while the cursor is
+  // on the other computer. The drag only looks for its window again when it has moved
+  CGWarpMouseCursorPosition(to);
+  CGEventRef event = CGEventCreateMouseEvent(nullptr, kCGEventLeftMouseDragged, to, kCGMouseButtonLeft);
   if (event != nullptr) {
     // posted after the HID event tap, so the core's own tap does not swallow it
     CGEventPost(kCGSessionEventTap, event);
@@ -1296,13 +1302,24 @@ void handOffMain(StatePtr s, uint32_t dragId, int32_t parkX, int32_t parkY)
   DFFileDragController *c = controllerOf(s);
   pruneSourceSessions(s);
 
-  // park the local drag over the catcher first: letting go there drops nothing
+  // park the local drag over the catcher first: letting go there drops nothing. Not where
+  // the cursor crossed: a drag held at the edge of a display is where the Dock, the hot
+  // corners and Mission Control react to it (the desktop changed to another Space), and a
+  // drag that does not move keeps the edge window as its target and never sees the catcher
   const auto displays = activeDisplays();
-  [c showCatcher:fd::squareAround(parkX, parkY, kCatcherSide, fd::displayAt(parkX, parkY, displays))];
+  const auto display = fd::displayAt(parkX, parkY, displays);
+  const fd::EdgeRect clear = fd::squareAround(parkX, parkY, 2 * kParkInset, display);
+  const int32_t x = clear.x + clear.w / 2;
+  const int32_t y = clear.y + clear.h / 2;
+  [c showCatcher:fd::squareAround(x, y, kCatcherSide, display)];
+  if (s->away) {
+    // not when the cursor already came back: it stays where the user has it
+    LOG_INFO("file drag %u: the local drag waits at %d,%d (the cursor crossed at %d,%d)", dragId, x, y, parkX, parkY);
+    moveLocalDrag(CGPointMake(x, y));
+  }
   ++s->stripGeneration;
   logWatchEnd(s);
   [c hideStrips];
-  nudgeLocalDrag();
   s->parked = true;
   const uint64_t generation = ++s->parkGeneration;
   dispatchMainAfter(0.5, ^{
@@ -1932,6 +1949,7 @@ void OSXFileDrag::handOff(uint32_t dragId, int32_t parkX, int32_t parkY)
   // drag happens over there and must still reach this computer once; on a client the
   // button was pressed by the server, and OSXComputer lets go of it when the drag is over
   m_state->parkedRelease = m_state->primary;
+  m_state->away = true;
   m_state->currentDragId = dragId;
   StatePtr s = m_state;
   dispatchMain(^{
@@ -1945,6 +1963,7 @@ void OSXFileDrag::takeBack()
     return;
   }
   m_state->parkedRelease = false;
+  m_state->away = false;
   if (const uint32_t id = m_state->currentDragId.exchange(0); id != 0) {
     LOG_INFO("file drag %u: cursor came back, stop sending", id);
     stopSourceSession(m_state, id);
@@ -1961,6 +1980,7 @@ void OSXFileDrag::entered()
     return;
   }
   m_state->parkedRelease = false;
+  m_state->away = false;
   StatePtr s = m_state;
   dispatchMain(^{
     unpark(s, "cursor is back");

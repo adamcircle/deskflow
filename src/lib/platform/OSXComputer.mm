@@ -1940,6 +1940,8 @@ void OSXComputer::fileDragReleaseParked(const char *why)
     // the cursor is away, over the catcher, which takes nothing: the drag ends here
     // without moving or copying anything on this computer
     LOG_INFO("file drag %u: letting go of the drag parked here (%s)", id, why);
+    // the hand-off moved the cursor to the catcher: let go where it is now
+    m_cursorPosValid = false;
     fakeMouseButton(kButtonLeft, false);
   }
 }
