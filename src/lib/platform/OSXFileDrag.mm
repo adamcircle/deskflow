@@ -699,6 +699,12 @@ DestPtr findDest(StatePtr s, uint32_t id); // any thread
     }
     return NSDragOperationNone;
   }
+  if (sender.draggingSource != nil) {
+    // a drag this app started shows files that came from another computer: it never
+    // goes back there (or on to a third computer) as a new drag
+    LOG_INFO("file drag: a drag of files from another computer reached the edge window; it stays here");
+    return NSDragOperationNone;
+  }
   NSPasteboard *pasteboard = sender.draggingPasteboard;
   ++s->watchEntered;
   LOG_INFO(

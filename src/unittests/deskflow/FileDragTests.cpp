@@ -1579,6 +1579,27 @@ void FileDragTests::remoteOfferNeedsWatchAndOnlyLeftButton()
   QVERIFY(!fileDragAllowsSwitch(c));
   c.phase = DragPhase::Offered;
   QVERIFY(fileDragAllowsSwitch(c));
+
+  // on the server with the drag: back to the client it came from, but not in the moment
+  // after crossing, when the hand that stopped at the edge moves back a few pixels
+  c.phase = DragPhase::Remote;
+  c.fromDragSource = false;
+  c.fromPrimary = true;
+  c.toPrimary = false;
+  c.toDragSource = true;
+  QVERIFY(fileDragAllowsSwitch(c));
+  c.justCrossed = true;
+  QVERIFY(!fileDragAllowsSwitch(c));
+
+  // the same for a drag that went from the server to a client
+  SwitchCheck s;
+  s.buttonsDown = left;
+  s.phase = DragPhase::Remote;
+  s.fromDragTarget = true;
+  s.toPrimary = true;
+  QVERIFY(fileDragAllowsSwitch(s));
+  s.justCrossed = true;
+  QVERIFY(!fileDragAllowsSwitch(s));
 }
 
 void FileDragTests::clientWatchesTheEdgeThatLeadsToTheServer_data()

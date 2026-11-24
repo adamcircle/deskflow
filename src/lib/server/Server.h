@@ -512,6 +512,8 @@ private:
   uint32_t m_fileDragId = 0;
   uint32_t m_fileDragNextId = 1;
   uint32_t m_fileDragWatchedSides = 0;
+  //! Arch::time() of the last hand-off; the cursor may not take the drag back right after it
+  double m_fileDragHandOffTime = 0.0;
   // the "held button keeps the cursor here" reason was logged for this press
   bool m_fileDragLockExplained = false;
   EventQueueTimer *m_fileDragTimer = nullptr;

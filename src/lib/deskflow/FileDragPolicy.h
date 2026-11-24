@@ -66,6 +66,7 @@ struct SwitchCheck
   bool fromDragTarget = false;   ///< the cursor is on the computer the file drag went to
   bool toPrimary = false;        ///< the destination is the primary
   bool toTakesFileDrags = false; ///< the destination is a secondary that can receive file drags
+  bool justCrossed = false;      ///< the drag was handed over less than kTakeBackDelay ago
 
   // client to server drags (the files come from a secondary)
   bool fromSecondary = false;         ///< the drag's files come from a secondary, not the primary
@@ -73,6 +74,14 @@ struct SwitchCheck
   bool toDragSource = false;          ///< the destination is the secondary the files come from
   bool primaryTakesFileDrags = false; ///< the primary can show a file drag and receive files
 };
+
+/**
+ * How long (seconds) after a hand-off the cursor may not go back with the drag. The cursor
+ * enters one or two pixels from the edge it crossed, and a hand that stops there after a
+ * quick move goes back by more than that: without the wait the drag went straight back
+ * ("cursor came back before the drop") and was cancelled.
+ */
+constexpr double kTakeBackDelay = 0.5;
 
 //! True when only the left mouse button is held
 constexpr bool onlyLeftButtonDown(uint32_t buttonsDown)
@@ -107,7 +116,7 @@ constexpr bool fileDragAllowsSwitch(const SwitchCheck &c)
       return c.fromDragSource && c.toPrimary && c.primaryTakesFileDrags;
     }
     if (c.phase == DragPhase::Remote) {
-      return c.fromPrimary && c.toDragSource;
+      return !c.justCrossed && c.fromPrimary && c.toDragSource;
     }
     return false;
   }
@@ -115,7 +124,7 @@ constexpr bool fileDragAllowsSwitch(const SwitchCheck &c)
     return c.fromPrimary && !c.toPrimary && c.toTakesFileDrags;
   }
   if (c.phase == DragPhase::Remote) {
-    return c.fromDragTarget && c.toPrimary;
+    return !c.justCrossed && c.fromDragTarget && c.toPrimary;
   }
   return false;
 }

@@ -8,6 +8,8 @@
 
 #include "server/Server.h"
 
+#include "arch/Arch.h"
+
 #include "base/IEventQueue.h"
 #include "base/Log.h"
 #include "deskflow/AppUtil.h"
@@ -2194,6 +2196,7 @@ bool Server::fileDragAllowsSwitch(const BaseClientProxy *dst) const
   check.fromDragTarget = m_fileDragTarget != nullptr && m_active == m_fileDragTarget;
   check.toPrimary = dst == m_primaryClient;
   check.toTakesFileDrags = dst != m_primaryClient && dst->fileDragAvailable();
+  check.justCrossed = Arch::time() - m_fileDragHandOffTime < deskflow::filedrag::kTakeBackDelay;
   check.fromSecondary = m_fileDragSource != nullptr;
   check.fromDragSource = m_fileDragSource != nullptr && m_active == m_fileDragSource;
   check.toDragSource = m_fileDragSource != nullptr && dst == m_fileDragSource;
@@ -2245,6 +2248,7 @@ void Server::fileDragBeforeSwitch(BaseClientProxy *dst)
         m_fileDragId = m_fileDragNextId++;
         m_fileDragTarget = m_primaryClient;
         m_fileDragPhase = FileDragPhase::Remote;
+        m_fileDragHandOffTime = Arch::time();
         LOG_INFO("file drag %u: carrying files from \"%s\" to this computer", m_fileDragId, getName(source).c_str());
         // the client parks its drag where its cursor will wait, then sends the items
         source->fileDragSend(Message::handOff(m_fileDragId));
@@ -2287,6 +2291,7 @@ void Server::fileDragBeforeSwitch(BaseClientProxy *dst)
       m_fileDragId = m_fileDragNextId++;
       m_fileDragTarget = dst;
       m_fileDragPhase = FileDragPhase::Remote;
+      m_fileDragHandOffTime = Arch::time();
       fileDragStopWatch();
       LOG_INFO("file drag %u: carrying files to \"%s\"", m_fileDragId, getName(dst).c_str());
       m_primaryClient->fileDragHandOff(m_fileDragId);
