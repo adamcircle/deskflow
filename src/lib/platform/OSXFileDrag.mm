@@ -391,6 +391,7 @@ struct OSXFileDrag::State : public std::enable_shared_from_this<OSXFileDrag::Sta
   unsigned watchUpdated = 0;   ///< draggingUpdated calls on an edge window during this watch
   bool catcherEntered = false; ///< the parked drag reached the catcher
   bool stripsParked = false;   ///< the edge windows stay up under a parked drag
+  bool parkedHidden = false;   ///< the parked drag shows no images (said in the log once per park)
   uint32_t parkedDragId = 0;
   int32_t parkAtX = 0; ///< where the parked drag waits
   int32_t parkAtY = 0;
@@ -1028,6 +1029,7 @@ struct FinderProgress
     // the parked local drag must never drop anything here
     if (s) {
       s->parkedOver = true;
+      [self hideParkedDrag:sender state:s];
     }
     if (s && !s->catcherEntered) {
       s->catcherEntered = true;
@@ -1040,6 +1042,7 @@ struct FinderProgress
   if (s->parked) {
     // the parked local drag is (back) at the edge: nothing is offered and nothing drops here
     s->parkedOver = true;
+    [self hideParkedDrag:sender state:s];
     return NSDragOperationNone;
   }
   if (sender.draggingSource != nil) {
@@ -1073,6 +1076,7 @@ struct FinderProgress
   auto s = _state.lock();
   if (s && s->parked) {
     s->parkedOver = true;
+    [self hideParkedDrag:sender state:s];
     return NSDragOperationNone;
   }
   const NSDragOperation answer =
@@ -1082,6 +1086,34 @@ struct FinderProgress
     LOG_INFO("file drag: the drag moves over the edge window, answer 0x%lx", static_cast<unsigned long>(answer));
   }
   return answer;
+}
+
+// While the cursor is on the other computer, the drag parked here shows nothing: its
+// images left on this screen looked as if the files had been dropped here. A drag gets the
+// images its source gave it back when it leaves the window that changed them, which this
+// one does when the cursor comes back and the window goes
+- (void)hideParkedDrag:(id<NSDraggingInfo>)sender state:(const StatePtr &)s
+{
+  if (!s->away) {
+    return;
+  }
+  [sender enumerateDraggingItemsWithOptions:NSDraggingItemEnumerationClearNonenumeratedImages
+                                    forView:self
+                                    classes:@[ NSPasteboardItem.class ]
+                              searchOptions:@{}
+                                 usingBlock:^(NSDraggingItem *item, NSInteger, BOOL *) {
+                                   item.imageComponentsProvider = nil;
+                                 }];
+  // and no badge with the number of items
+  sender.numberOfValidItemsForDrop = 0;
+  sender.draggingFormation = NSDraggingFormationNone;
+  if (!s->parkedHidden) {
+    s->parkedHidden = true;
+    LOG_INFO(
+        "file drag %u: the parked drag is hidden while the cursor is away (window %ld)", s->parkedDragId,
+        static_cast<long>(self.window.windowNumber)
+    );
+  }
 }
 
 - (void)draggingExited:(id<NSDraggingInfo>)sender
@@ -2117,6 +2149,7 @@ void handOffMain(StatePtr s, uint32_t dragId, int32_t parkX, int32_t parkY)
   // get to the catcher is still over a window that refuses it when the button is let go.
   // Without it the app at the edge of the screen got the files then
   s->parked = true;
+  s->parkedHidden = false;
   s->parkedOver = s->overStrip;
   s->stripsParked = true;
   s->parkedDragId = dragId;
