@@ -34,6 +34,8 @@
 #include "platform/OSXScreenSaver.h"
 
 #include <AppKit/NSEvent.h>
+#include <AppKit/NSRunningApplication.h>
+#include <ApplicationServices/ApplicationServices.h>
 #include <AvailabilityMacros.h>
 #include <IOKit/hidsystem/event_status_driver.h>
 #include <dispatch/dispatch.h>
@@ -68,6 +70,46 @@ static inline bool needsEventNumber()
 }
 
 int getSecureInputEventPID();
+
+namespace {
+
+// When an app on this computer holds Secure Input (usually a focused password field),
+// macOS hides every key from us, so nothing typed reaches the client we switch to.
+// Bring Finder to the front, as clicking the desktop would: the password field loses
+// focus and well-behaved apps then turn Secure Input off.
+void releaseSecureInputFocus()
+{
+  if (!IsSecureEventInputEnabled()) {
+    return;
+  }
+
+  NSRunningApplication *finder =
+      [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.finder"].firstObject;
+  if (finder == nil) {
+    LOG_DEBUG("secure input is on but finder is not running, focus left alone");
+    return;
+  }
+
+  AXUIElementRef app = AXUIElementCreateApplication(finder.processIdentifier);
+  const AXError error = AXUIElementSetAttributeValue(app, kAXFrontmostAttribute, kCFBooleanTrue);
+  CFRelease(app);
+  if (error != kAXErrorSuccess) {
+    LOG_DEBUG("secure input is on but focus could not be moved, error=%d", static_cast<int>(error));
+    return;
+  }
+
+  // the app turns Secure Input off asynchronously once it loses focus
+  for (int i = 0; i < 20 && IsSecureEventInputEnabled(); ++i) {
+    Arch::sleep(0.01);
+  }
+  if (IsSecureEventInputEnabled()) {
+    LOG_INFO("moved focus away from a secure input field but secure input is still on");
+  } else {
+    LOG_INFO("moved focus away from a secure input field so keys reach other computers");
+  }
+}
+
+} // namespace
 std::string getProcessName(int pid);
 
 // TODO: upgrade deprecated function usage in these functions.
@@ -818,6 +860,11 @@ bool OSXComputer::canLeave()
 
 void OSXComputer::leave()
 {
+  // before hiding the cursor: bringing another app to the front shows it again
+  if (m_isPrimary) {
+    releaseSecureInputFocus();
+  }
+
   hideCursor();
 
   if (m_isPrimary) {
