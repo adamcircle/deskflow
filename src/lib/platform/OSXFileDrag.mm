@@ -108,17 +108,36 @@ constexpr size_t kPictureItems = 3;
 constexpr CGFloat kPictureStackStep = 6;
 //! Space between the icon and the name, in points
 constexpr CGFloat kPictureLabelGap = 4;
-//! Widest name, in points (longer ones take two lines and lose their middle)
-constexpr CGFloat kPictureLabelWidth = 140;
-constexpr CGFloat kPictureLabelFontSize = 12;
+//! Icon, label text and grid spacing ranges for a picture of a Finder drag (defaults match Finder's)
+constexpr CGFloat kPictureMinIconSize = 16;
+constexpr CGFloat kPictureMaxIconSize = 128;
+constexpr CGFloat kPictureDefaultIconSize = 64;
+constexpr CGFloat kPictureMinTextSize = 10;
+constexpr CGFloat kPictureMaxTextSize = 16;
+constexpr CGFloat kPictureDefaultTextSize = 12;
+constexpr CGFloat kPictureMinGridSpacing = 1;
+constexpr CGFloat kPictureMaxGridSpacing = 100;
+constexpr CGFloat kPictureDefaultGridSpacing = 54;
+//! Bounds on the label text width derived from Finder's icon size and grid spacing, in points
+constexpr CGFloat kPictureMinLabelWidth = 64;
+constexpr CGFloat kPictureMaxLabelWidth = 180;
+//! Highest pixel density of the picture, whatever this computer's screen is (the other one may be
+//! Retina); lowered if the canvas would exceed fd::kMaxIconSide
+constexpr CGFloat kPictureMaxPixelsPerPoint = 2;
 //! The name's highlight reaches this far beyond its text, in points, and has this corner radius
 constexpr CGFloat kPictureLabelPadX = 5;
 constexpr CGFloat kPictureLabelPadY = 1.5;
 constexpr CGFloat kPictureLabelRadius = 4;
 //! How opaque the picture is (a drag out of Finder lets the screen show through)
 constexpr CGFloat kPictureAlpha = 0.85;
-//! The picture is made with the icons that are there after this long; thumbnails that take longer are left out
-constexpr double kPictureBudgetSeconds = 0.25;
+
+//! Icon-view sizes read from Finder's preferences so the drag picture matches Finder
+struct FinderIconViewMetrics
+{
+  CGFloat iconSize = kPictureDefaultIconSize;
+  CGFloat textSize = kPictureDefaultTextSize;
+  CGFloat labelWidth = kPictureDefaultIconSize + kPictureDefaultGridSpacing - 6 - 2 * kPictureLabelPadX;
+};
 
 enum class DestPhase : int
 {
@@ -161,8 +180,8 @@ struct Offer
 
   // main thread only: the picture of the drag made from its files (see makePicture())
   fd::Icon picture;
-  NSMutableArray *thumbnails = nil; ///< an NSImage per shown item, NSNull until it is there
-  size_t thumbnailsLeft = 0;
+  FinderIconViewMetrics pictureMetrics;
+  QLThumbnailRepresentation *thumbnails[kPictureItems] = {}; ///< best so far for each shown item
   bool pictureMade = false;
   CFAbsoluteTime pictureStarted = 0;
 };
@@ -706,6 +725,7 @@ NSImage *imageFromIcon(const fd::Icon &icon)
     size = NSMakeSize(points, static_cast<CGFloat>(points) * icon.height / icon.width);
     memset(rep.bitmapData, 0, 4); // the pixel that says so
   }
+  rep.size = size;
   NSImage *image = [[NSImage alloc] initWithSize:size];
   [image addRepresentation:rep];
   return image;
@@ -1508,6 +1528,67 @@ void offerLost(StatePtr s)
 }
 
 /**
+ * Reads Finder's icon-view icon size, label text size and grid spacing from its preferences
+ * (read-only): DesktopViewSettings -> IconViewSettings first, then StandardViewSettings ->
+ * IconViewSettings, falling back to Finder's defaults.
+ */
+FinderIconViewMetrics finderIconViewMetrics()
+{
+  const auto readNumber = [](NSDictionary *dict, NSString *key, CGFloat &out) -> bool {
+    if (![dict isKindOfClass:NSDictionary.class]) {
+      return false;
+    }
+    id value = dict[key];
+    if (![value isKindOfClass:NSNumber.class]) {
+      return false;
+    }
+    const CGFloat number = [value doubleValue];
+    if (!std::isfinite(number) || number <= 0) {
+      return false;
+    }
+    out = number;
+    return true;
+  };
+  const auto iconViewDict = [](CFStringRef prefKey) -> NSDictionary * {
+    id top = CFBridgingRelease(CFPreferencesCopyAppValue(prefKey, CFSTR("com.apple.finder")));
+    if (![top isKindOfClass:NSDictionary.class]) {
+      return nil;
+    }
+    id ivs = top[@"IconViewSettings"];
+    return [ivs isKindOfClass:NSDictionary.class] ? ivs : nil;
+  };
+
+  NSDictionary *desktop = iconViewDict(CFSTR("DesktopViewSettings"));
+  NSDictionary *standard = iconViewDict(CFSTR("StandardViewSettings"));
+
+  CGFloat iconSize = kPictureDefaultIconSize;
+  if (!readNumber(desktop, @"iconSize", iconSize)) {
+    readNumber(standard, @"iconSize", iconSize);
+  }
+  iconSize = std::clamp(iconSize, kPictureMinIconSize, kPictureMaxIconSize);
+
+  CGFloat textSize = kPictureDefaultTextSize;
+  if (!readNumber(desktop, @"textSize", textSize)) {
+    readNumber(standard, @"textSize", textSize);
+  }
+  textSize = std::clamp(textSize, kPictureMinTextSize, kPictureMaxTextSize);
+
+  CGFloat gridSpacing = kPictureDefaultGridSpacing;
+  if (!readNumber(desktop, @"gridSpacing", gridSpacing)) {
+    readNumber(standard, @"gridSpacing", gridSpacing);
+  }
+  gridSpacing = std::clamp(gridSpacing, kPictureMinGridSpacing, kPictureMaxGridSpacing);
+
+  // Finder's icon-view cell width tracks iconSize + gridSpacing (at 64 and 54 it measures
+  // 112 pt across, with ~100 pt of text inside the selection pill padding).
+  const CGFloat minLabel = std::max(iconSize, kPictureMinLabelWidth);
+  const CGFloat labelWidth =
+      std::clamp(iconSize + gridSpacing - 6 - 2 * kPictureLabelPadX, minLabel, kPictureMaxLabelWidth);
+
+  return {iconSize, textSize, labelWidth};
+}
+
+/**
  * Makes the picture of \p offer's drag from its files, once: the first items' icons one
  * behind the other and the first item's name under them, with the cursor on the middle of the
  * front icon. Items whose thumbnail is not there yet show their plain icon.
@@ -1519,14 +1600,19 @@ void makePicture(const std::shared_ptr<Offer> &offer)
   }
   offer->pictureMade = true;
 
+  const FinderIconViewMetrics &metrics = offer->pictureMetrics;
+  const CGFloat side = metrics.iconSize;
+  const CGFloat textSize = metrics.textSize;
+  const CGFloat labelWidth = metrics.labelWidth;
+
   const size_t shown = std::min(offer->paths.size(), kPictureItems);
   NSMutableArray<NSImage *> *images = [NSMutableArray array];
   size_t thumbnails = 0;
   for (size_t i = 0; i < shown; ++i) {
-    id have = i < offer->thumbnails.count ? offer->thumbnails[i] : nil;
-    if ([have isKindOfClass:NSImage.class]) {
-      [images addObject:have];
-      ++thumbnails;
+    QLThumbnailRepresentation *have = offer->thumbnails[i];
+    if (have != nil) {
+      [images addObject:have.NSImage];
+      thumbnails += have.type != QLThumbnailRepresentationTypeIcon;
     } else {
       [images addObject:[[NSWorkspace sharedWorkspace] iconForFile:toNSString(offer->paths[i].string())]];
     }
@@ -1536,15 +1622,14 @@ void makePicture(const std::shared_ptr<Offer> &offer)
   NSString *name = [[NSFileManager defaultManager] displayNameAtPath:toNSString(offer->paths.front().string())];
   NSMutableParagraphStyle *style = [[NSMutableParagraphStyle alloc] init];
   style.alignment = NSTextAlignmentCenter;
-  NSTextStorage *storage =
-      [[NSTextStorage alloc] initWithString:name
-                                 attributes:@{
-                                   NSFontAttributeName : [NSFont systemFontOfSize:kPictureLabelFontSize],
-                                   NSForegroundColorAttributeName : NSColor.whiteColor,
-                                   NSParagraphStyleAttributeName : style,
-                                 }];
+  NSTextStorage *storage = [[NSTextStorage alloc] initWithString:name
+                                                      attributes:@{
+                                                        NSFontAttributeName : [NSFont systemFontOfSize:textSize],
+                                                        NSForegroundColorAttributeName : NSColor.whiteColor,
+                                                        NSParagraphStyleAttributeName : style,
+                                                      }];
   NSLayoutManager *layout = [[NSLayoutManager alloc] init];
-  NSTextContainer *container = [[NSTextContainer alloc] initWithSize:NSMakeSize(kPictureLabelWidth, CGFLOAT_MAX)];
+  NSTextContainer *container = [[NSTextContainer alloc] initWithSize:NSMakeSize(labelWidth, CGFLOAT_MAX)];
   container.lineFragmentPadding = 0;
   container.maximumNumberOfLines = 2;
   container.lineBreakMode = NSLineBreakByTruncatingMiddle;
@@ -1553,14 +1638,14 @@ void makePicture(const std::shared_ptr<Offer> &offer)
   const NSRange glyphs = [layout glyphRangeForTextContainer:container];
   const NSRect text = [layout usedRectForTextContainer:container];
 
-  // in points, from the top left, with the cursor in the middle
-  const CGFloat side = kDragImageSide;
+  // in points, from the top left, with the cursor in the middle. Up to 2 pixels per point
+  // whatever this screen is; fewer if the canvas would not fit fd::kMaxIconSide, never a
+  // smaller size in points
   const CGFloat stack = (shown - 1) * kPictureStackStep;
   const NSSize label = NSMakeSize(text.size.width + 2 * kPictureLabelPadX, text.size.height + 2 * kPictureLabelPadY);
   const CGFloat halfW = std::ceil(std::max(side / 2 + stack, label.width / 2)) + 1;
   const CGFloat halfH = std::ceil(std::max(side / 2 + stack, side / 2 + kPictureLabelGap + label.height)) + 1;
-  const CGFloat screenScale = std::clamp<CGFloat>(NSScreen.mainScreen.backingScaleFactor, 1, 2);
-  const CGFloat scale = std::min(screenScale, fd::kMaxIconSide / (2 * std::max(halfW, halfH)));
+  const CGFloat scale = std::min(kPictureMaxPixelsPerPoint, fd::kMaxIconSide / (2 * std::max(halfW, halfH)));
   const auto width = static_cast<uint16_t>(std::min<CGFloat>(std::ceil(2 * halfW * scale), fd::kMaxIconSide));
   const auto height = static_cast<uint16_t>(std::min<CGFloat>(std::ceil(2 * halfH * scale), fd::kMaxIconSide));
 
@@ -1591,7 +1676,7 @@ void makePicture(const std::shared_ptr<Offer> &offer)
                    }];
     }
 
-    const NSPoint origin = NSMakePoint(halfW - kPictureLabelWidth / 2, halfH + side / 2 + kPictureLabelGap);
+    const NSPoint origin = NSMakePoint(halfW - labelWidth / 2, halfH + side / 2 + kPictureLabelGap);
     [highlight setFill];
     [[NSBezierPath bezierPathWithRoundedRect:NSMakeRect(
                                                  origin.x + NSMinX(text) - kPictureLabelPadX, origin.y + NSMinY(text),
@@ -1606,48 +1691,57 @@ void makePicture(const std::shared_ptr<Offer> &offer)
   });
   fd::setIconPointWidth(offer->picture, static_cast<uint16_t>(std::lround(width / scale)));
   LOG_INFO(
-      "file drag: picture of the drag made from its files (%zu of %zu items, %zu thumbnails, \"%s\"): %ux%u px, %u "
-      "points wide, %.0f ms after the files were known",
-      shown, offer->paths.size(), thumbnails, toUtf8(name).c_str(), offer->picture.width, offer->picture.height,
-      fd::iconPointWidth(offer->picture), (CFAbsoluteTimeGetCurrent() - offer->pictureStarted) * 1000.0
+      "file drag: picture of the drag made from its files (%zu of %zu items, %zu thumbnails, %zu icons, \"%s\"): %ux%u "
+      "px (%.2f px/pt), %u points wide (icon %.0f pt, text %.0f pt), %.0f ms after the files were known",
+      shown, offer->paths.size(), thumbnails, shown - thumbnails, toUtf8(name).c_str(), offer->picture.width,
+      offer->picture.height, scale, fd::iconPointWidth(offer->picture), side, textSize,
+      (CFAbsoluteTimeGetCurrent() - offer->pictureStarted) * 1000.0
   );
 }
 
-//! Asks for thumbnails of the first items of \p offer's drag; makePicture() follows when they are there
+//! Asks for thumbnails of the first items of \p offer's drag, keeping the best until hand-off
 void requestThumbnails(std::shared_ptr<Offer> offer)
 {
+  offer->pictureMetrics = finderIconViewMetrics();
+  const CGFloat side = offer->pictureMetrics.iconSize;
   const size_t shown = std::min(offer->paths.size(), kPictureItems);
-  offer->thumbnails = [NSMutableArray array];
-  offer->thumbnailsLeft = shown;
+  std::weak_ptr<Offer> weak = offer;
   offer->pictureStarted = CFAbsoluteTimeGetCurrent();
-  const CGFloat scale = std::clamp<CGFloat>(NSScreen.mainScreen.backingScaleFactor, 1, 2);
   for (size_t i = 0; i < shown; ++i) {
-    [offer->thumbnails addObject:NSNull.null];
     NSURL *url = [NSURL fileURLWithPath:toNSString(offer->paths[i].string())];
     QLThumbnailGenerationRequest *request =
         [[QLThumbnailGenerationRequest alloc] initWithFileAtURL:url
-                                                           size:CGSizeMake(kDragImageSide, kDragImageSide)
-                                                          scale:scale
+                                                           size:CGSizeMake(side, side)
+                                                          scale:kPictureMaxPixelsPerPoint
                                             representationTypes:QLThumbnailGenerationRequestRepresentationTypeAll];
-    // as Finder shows a file: a page with its corner turned for a document, a frame for a picture
-    request.iconMode = YES;
+    // as Finder shows a file: a page with its corner turned for a document, a picture with a
+    // little room around it. A film shows as its whole frame. Some Macs know no type for Matroska
+    NSString *ext = url.pathExtension.lowercaseString;
+    UTType *type = ext.length > 0 ? [UTType typeWithFilenameExtension:ext] : nil;
+    request.iconMode = ![type conformsToType:UTTypeMovie] && ![ext isEqualToString:@"mkv"];
     [QLThumbnailGenerator.sharedGenerator
-        generateBestRepresentationForRequest:request
-                           completionHandler:^(QLThumbnailRepresentation *thumbnail, NSError *) {
-                             NSImage *image = thumbnail.NSImage;
-                             dispatchMain(^{
-                               if (image != nil && !offer->pictureMade) {
-                                 offer->thumbnails[i] = image;
-                               }
-                               if (offer->thumbnailsLeft > 0 && --offer->thumbnailsLeft == 0) {
-                                 makePicture(offer);
-                               }
-                             });
-                           }];
+        generateRepresentationsForRequest:request
+                            updateHandler:^(
+                                QLThumbnailRepresentation *thumbnail, QLThumbnailRepresentationType, NSError *
+                            ) {
+                              if (thumbnail == nil) {
+                                return;
+                              }
+                              dispatchMain(^{
+                                auto current = weak.lock();
+                                if (!current) {
+                                  return;
+                                }
+                                auto previous = current->thumbnails[i];
+                                if (previous == nil || thumbnail.type > previous.type) {
+                                  current->thumbnails[i] = thumbnail;
+                                  // a picture already sent stays as it is; the next time
+                                  // this drag crosses, it is made again with this one
+                                  current->pictureMade = false;
+                                }
+                              });
+                            }];
   }
-  dispatchMainAfter(kPictureBudgetSeconds, ^{
-    makePicture(offer);
-  });
 }
 
 //! Builds the item list of a drag of \p paths (on a worker thread) unless it is this drag's already
