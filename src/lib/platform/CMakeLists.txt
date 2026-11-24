@@ -204,7 +204,9 @@ if(UNIX)
     find_library(COCOA_LIBRARY Cocoa)
     # file drag: file promise types (UTType, macOS 11 and later)
     find_library(UTI_LIBRARY UniformTypeIdentifiers REQUIRED)
-    target_link_libraries(platform PUBLIC ${COCOA_LIBRARY} ${UTI_LIBRARY})
+    # file drag: thumbnails for the picture of a drag (macOS 10.15 and later)
+    find_library(QLT_LIBRARY QuickLookThumbnailing REQUIRED)
+    target_link_libraries(platform PUBLIC ${COCOA_LIBRARY} ${UTI_LIBRARY} ${QLT_LIBRARY})
     # the file drag code manages its Objective-C objects with ARC; the rest of the
     # platform code does it by hand
     set_source_files_properties(OSXFileDrag.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")

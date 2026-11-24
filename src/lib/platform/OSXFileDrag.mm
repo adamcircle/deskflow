@@ -31,6 +31,7 @@
 
 #import <AppKit/AppKit.h>
 #include <ApplicationServices/ApplicationServices.h>
+#import <QuickLookThumbnailing/QuickLookThumbnailing.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <pthread.h>
 
@@ -92,6 +93,27 @@ constexpr CGFloat kPreviewPixelsPerPoint = kIconPixels / kDragImageSide;
 //! A larger drag gets a coarser picture, down to this; what is farther from the cursor is cut off
 constexpr CGFloat kPreviewMinPixelsPerPoint = 0.75;
 
+// A picture of the drag made from its files, as Finder shows a drag out of an icon view: the
+// icon (a thumbnail of the file, if it has one) with the name under it. Used when the drag
+// itself shows this app no image to copy, which is what Finder's drags do.
+//! Most items shown, one behind the other
+constexpr size_t kPictureItems = 3;
+//! How far each item behind the first is set off, up and to the right, in points
+constexpr CGFloat kPictureStackStep = 6;
+//! Space between the icon and the name, in points
+constexpr CGFloat kPictureLabelGap = 4;
+//! Widest name, in points (longer ones take two lines and lose their middle)
+constexpr CGFloat kPictureLabelWidth = 140;
+constexpr CGFloat kPictureLabelFontSize = 12;
+//! The name's highlight reaches this far beyond its text, in points, and has this corner radius
+constexpr CGFloat kPictureLabelPadX = 5;
+constexpr CGFloat kPictureLabelPadY = 1.5;
+constexpr CGFloat kPictureLabelRadius = 4;
+//! How opaque the picture is (a drag out of Finder lets the screen show through)
+constexpr CGFloat kPictureAlpha = 0.85;
+//! The picture is made with the icons that are there after this long; thumbnails that take longer are left out
+constexpr double kPictureBudgetSeconds = 0.25;
+
 enum class DestPhase : int
 {
   Waiting, ///< start window shown, waiting for the button press
@@ -130,6 +152,13 @@ struct Offer
   fd::Icon icon;
   bool ready = false;
   double scanMs = 0; ///< how long building the item list and the icon took
+
+  // main thread only: the picture of the drag made from its files (see makePicture())
+  fd::Icon picture;
+  NSMutableArray *thumbnails = nil; ///< an NSImage per shown item, NSNull until it is there
+  size_t thumbnailsLeft = 0;
+  bool pictureMade = false;
+  CFAbsoluteTime pictureStarted = 0;
 };
 
 //! Streams the files of one drag on its own thread (primary)
@@ -1429,6 +1458,149 @@ void offerLost(StatePtr s)
   }
 }
 
+/**
+ * Makes the picture of \p offer's drag from its files, once: the first items' icons one
+ * behind the other and the first item's name under them, with the cursor on the middle of the
+ * front icon. Items whose thumbnail is not there yet show their plain icon.
+ */
+void makePicture(const std::shared_ptr<Offer> &offer)
+{
+  if (offer->pictureMade || offer->paths.empty()) {
+    return;
+  }
+  offer->pictureMade = true;
+
+  const size_t shown = std::min(offer->paths.size(), kPictureItems);
+  NSMutableArray<NSImage *> *images = [NSMutableArray array];
+  size_t thumbnails = 0;
+  for (size_t i = 0; i < shown; ++i) {
+    id have = i < offer->thumbnails.count ? offer->thumbnails[i] : nil;
+    if ([have isKindOfClass:NSImage.class]) {
+      [images addObject:have];
+      ++thumbnails;
+    } else {
+      [images addObject:[[NSWorkspace sharedWorkspace] iconForFile:toNSString(offer->paths[i].string())]];
+    }
+  }
+
+  // the name as Finder shows it (it may hide the extension): centred, two lines at most
+  NSString *name = [[NSFileManager defaultManager] displayNameAtPath:toNSString(offer->paths.front().string())];
+  NSMutableParagraphStyle *style = [[NSMutableParagraphStyle alloc] init];
+  style.alignment = NSTextAlignmentCenter;
+  NSTextStorage *storage =
+      [[NSTextStorage alloc] initWithString:name
+                                 attributes:@{
+                                   NSFontAttributeName : [NSFont systemFontOfSize:kPictureLabelFontSize],
+                                   NSForegroundColorAttributeName : NSColor.whiteColor,
+                                   NSParagraphStyleAttributeName : style,
+                                 }];
+  NSLayoutManager *layout = [[NSLayoutManager alloc] init];
+  NSTextContainer *container = [[NSTextContainer alloc] initWithSize:NSMakeSize(kPictureLabelWidth, CGFLOAT_MAX)];
+  container.lineFragmentPadding = 0;
+  container.maximumNumberOfLines = 2;
+  container.lineBreakMode = NSLineBreakByTruncatingMiddle;
+  [layout addTextContainer:container];
+  [storage addLayoutManager:layout];
+  const NSRange glyphs = [layout glyphRangeForTextContainer:container];
+  const NSRect text = [layout usedRectForTextContainer:container];
+
+  // in points, from the top left, with the cursor in the middle
+  const CGFloat side = kDragImageSide;
+  const CGFloat stack = (shown - 1) * kPictureStackStep;
+  const NSSize label = NSMakeSize(text.size.width + 2 * kPictureLabelPadX, text.size.height + 2 * kPictureLabelPadY);
+  const CGFloat halfW = std::ceil(std::max(side / 2 + stack, label.width / 2)) + 1;
+  const CGFloat halfH = std::ceil(std::max(side / 2 + stack, side / 2 + kPictureLabelGap + label.height)) + 1;
+  const CGFloat screenScale = std::clamp<CGFloat>(NSScreen.mainScreen.backingScaleFactor, 1, 2);
+  const CGFloat scale = std::min(screenScale, fd::kMaxIconSide / (2 * std::max(halfW, halfH)));
+  const auto width = static_cast<uint16_t>(std::min<CGFloat>(std::ceil(2 * halfW * scale), fd::kMaxIconSide));
+  const auto height = static_cast<uint16_t>(std::min<CGFloat>(std::ceil(2 * halfH * scale), fd::kMaxIconSide));
+
+  NSColor *highlight = NSColor.selectedContentBackgroundColor;
+  offer->picture = renderIcon(width, height, ^(CGContextRef context) {
+    CGContextTranslateCTM(context, 0, height);
+    CGContextScaleCTM(context, scale, -scale);
+    CGContextSetAlpha(context, kPictureAlpha);
+    CGContextBeginTransparencyLayer(context, nullptr);
+    [NSGraphicsContext saveGraphicsState];
+    NSGraphicsContext.currentContext = [NSGraphicsContext graphicsContextWithCGContext:context flipped:YES];
+
+    for (size_t n = shown; n-- > 0;) {
+      NSImage *image = images[n];
+      const NSSize size = image.size;
+      const CGFloat fit = (size.width > 0 && size.height > 0) ? side / std::max(size.width, size.height) : 0;
+      const NSRect box = NSMakeRect(
+          halfW + n * kPictureStackStep - size.width * fit / 2, halfH - n * kPictureStackStep - size.height * fit / 2,
+          size.width * fit, size.height * fit
+      );
+      [image drawInRect:box
+                fromRect:NSZeroRect
+               operation:NSCompositingOperationSourceOver
+                fraction:1.0
+          respectFlipped:YES
+                   hints:@{
+                     NSImageHintInterpolation : @(NSImageInterpolationHigh)
+                   }];
+    }
+
+    const NSPoint origin = NSMakePoint(halfW - kPictureLabelWidth / 2, halfH + side / 2 + kPictureLabelGap);
+    [highlight setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:NSMakeRect(
+                                                 origin.x + NSMinX(text) - kPictureLabelPadX, origin.y + NSMinY(text),
+                                                 label.width, label.height
+                                             )
+                                     xRadius:kPictureLabelRadius
+                                     yRadius:kPictureLabelRadius] fill];
+    [layout drawGlyphsForGlyphRange:glyphs atPoint:NSMakePoint(origin.x, origin.y + kPictureLabelPadY)];
+
+    [NSGraphicsContext restoreGraphicsState];
+    CGContextEndTransparencyLayer(context);
+  });
+  fd::setIconPointWidth(offer->picture, static_cast<uint16_t>(std::lround(width / scale)));
+  LOG_INFO(
+      "file drag: picture of the drag made from its files (%zu of %zu items, %zu thumbnails, \"%s\"): %ux%u px, %u "
+      "points wide, %.0f ms after the files were known",
+      shown, offer->paths.size(), thumbnails, toUtf8(name).c_str(), offer->picture.width, offer->picture.height,
+      fd::iconPointWidth(offer->picture), (CFAbsoluteTimeGetCurrent() - offer->pictureStarted) * 1000.0
+  );
+}
+
+//! Asks for thumbnails of the first items of \p offer's drag; makePicture() follows when they are there
+void requestThumbnails(std::shared_ptr<Offer> offer)
+{
+  const size_t shown = std::min(offer->paths.size(), kPictureItems);
+  offer->thumbnails = [NSMutableArray array];
+  offer->thumbnailsLeft = shown;
+  offer->pictureStarted = CFAbsoluteTimeGetCurrent();
+  const CGFloat scale = std::clamp<CGFloat>(NSScreen.mainScreen.backingScaleFactor, 1, 2);
+  for (size_t i = 0; i < shown; ++i) {
+    [offer->thumbnails addObject:NSNull.null];
+    NSURL *url = [NSURL fileURLWithPath:toNSString(offer->paths[i].string())];
+    QLThumbnailGenerationRequest *request =
+        [[QLThumbnailGenerationRequest alloc] initWithFileAtURL:url
+                                                           size:CGSizeMake(kDragImageSide, kDragImageSide)
+                                                          scale:scale
+                                            representationTypes:QLThumbnailGenerationRequestRepresentationTypeAll];
+    // as Finder shows a file: a page with its corner turned for a document, a frame for a picture
+    request.iconMode = YES;
+    [QLThumbnailGenerator.sharedGenerator
+        generateBestRepresentationForRequest:request
+                           completionHandler:^(QLThumbnailRepresentation *thumbnail, NSError *) {
+                             NSImage *image = thumbnail.NSImage;
+                             dispatchMain(^{
+                               if (image != nil && !offer->pictureMade) {
+                                 offer->thumbnails[i] = image;
+                               }
+                               if (offer->thumbnailsLeft > 0 && --offer->thumbnailsLeft == 0) {
+                                 makePicture(offer);
+                               }
+                             });
+                           }];
+  }
+  dispatchMainAfter(kPictureBudgetSeconds, ^{
+    makePicture(offer);
+  });
+}
+
 //! Builds the item list of a drag of \p paths (on a worker thread) unless it is this drag's already
 void prepareOffer(StatePtr s, std::vector<fs::path> paths, NSInteger changeCount)
 {
@@ -1443,6 +1615,8 @@ void prepareOffer(StatePtr s, std::vector<fs::path> paths, NSInteger changeCount
   offer->paths = std::move(paths);
   offer->changeCount = changeCount;
   s->offer = offer;
+  // not waited for: the offer is ready when its list is, the picture when the hand-off comes
+  requestThumbnails(offer);
   const uint64_t generation = ++s->scanGeneration;
   const CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
   WeakState weak = s;
@@ -1488,7 +1662,7 @@ void onFilesEntered(StatePtr s, std::vector<fs::path> paths, id<NSDraggingInfo> 
     s->previewSequence = sender.draggingSequenceNumber;
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     if (s->preview.isEmpty()) {
-      LOG_INFO("file drag: the drag shows no image to copy, the file's icon stands for it (%.1f ms)", ms);
+      LOG_INFO("file drag: the drag shows no image to copy, a picture made from the files stands for it (%.1f ms)", ms);
     } else {
       LOG_INFO(
           "file drag: drag image captured: %ux%u px, %u points wide, from %lu items in %.1f ms", s->preview.width,
@@ -1765,13 +1939,30 @@ void handOffMain(StatePtr s, uint32_t dragId, int32_t parkX, int32_t parkY)
   } else {
     LOG_INFO("file drag %u: sending %zu items", dragId, offer.items.size());
   }
-  // a picture of the whole drag for a computer that shows one, else the first file's icon
-  const bool preview = s->peerPreview && !s->preview.isEmpty();
-  if (preview || !offer.icon.isEmpty()) {
+  // a picture of the whole drag for a computer that shows one: the drag's own images or,
+  // where the drag shows none (Finder's), one made from the files. Else the first file's icon
+  const fd::Icon *shows = nullptr;
+  const char *what = "nothing";
+  if (s->peerPreview && !s->preview.isEmpty()) {
+    shows = &s->preview;
+    what = "the drag as it looks here";
+  } else if (s->peerPreview) {
+    makePicture(s->offer); // with the thumbnails that are there by now
+    if (!offer.picture.isEmpty()) {
+      shows = &offer.picture;
+      what = "a picture made from the files";
+    }
+  }
+  if (shows == nullptr && !offer.icon.isEmpty()) {
+    shows = &offer.icon;
+    what = "the first file's icon";
+  }
+  LOG_INFO("file drag %u: the other computer shows %s", dragId, what);
+  if (shows != nullptr) {
     fd::Message icon;
     icon.type = fd::Message::Type::Icon;
     icon.dragId = dragId;
-    icon.icon = preview ? s->preview : offer.icon;
+    icon.icon = *shows;
     s->sendPeer(icon);
   }
   fd::Message begin;
