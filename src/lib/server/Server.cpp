@@ -384,8 +384,11 @@ bool Server::isLockedToComputer() const
     return true;
   }
 
-  // locked if primary says we're locked
-  if (m_primaryClient->isLockedToComputer()) {
+  // locked while a button is held. m_buttonsDown counts every press this server saw; the
+  // primary is asked as well, but its answer misses a button pressed while the cursor is
+  // on a client (on macOS the event tap takes that press before the system counts it), and
+  // a drag started on a client then left that client at its first edge
+  if (m_buttonsDown != 0 || m_primaryClient->isLockedToComputer()) {
     return true;
   }
 
@@ -463,7 +466,7 @@ void Server::switchComputer(BaseClientProxy *dst, int32_t x, int32_t y, bool for
     // hand a file drag over (or take it back) before the cursor moves
     fileDragBeforeSwitch(dst);
     if (m_fileDragRemoteWatchClient == m_active) {
-      fileDragStopRemoteWatch();
+      fileDragStopRemoteWatch("the cursor leaves it");
     }
 
     // leave active computer
@@ -1649,7 +1652,7 @@ void Server::onMouseUp(ButtonID id)
       fileDragEnd("released before crossing");
     }
     fileDragStopWatch();
-    fileDragStopRemoteWatch();
+    fileDragStopRemoteWatch("the left button was released");
   }
 }
 
@@ -2534,10 +2537,14 @@ void Server::onFileDragMessage(BaseClientProxy *client, const Message &message)
 // file drag: client to server
 //
 
-void Server::fileDragStopRemoteWatch()
+void Server::fileDragStopRemoteWatch(const char *why)
 {
   if (m_fileDragRemoteWatchClient != nullptr && m_fileDragRemoteWatchSides != 0) {
-    LOG_INFO("file drag: \"%s\" stops watching its edge", getName(m_fileDragRemoteWatchClient).c_str());
+    LOG_INFO(
+        "file drag: \"%s\" stops watching its edge: %s (buttons 0x%x; file drag: %s; cursor %d,%d)",
+        getName(m_fileDragRemoteWatchClient).c_str(), why, m_buttonsDown,
+        deskflow::filedrag::dragPhaseName(m_fileDragPhase), m_x, m_y
+    );
     m_fileDragRemoteWatchClient->fileDragSend(Message::watch(0));
   }
   m_fileDragRemoteWatchClient = nullptr;
@@ -2569,20 +2576,20 @@ void Server::fileDragUpdateRemoteWatch(int32_t x, int32_t y)
   }
 
   if (m_fileDragRemoteWatchClient != nullptr && m_fileDragRemoteWatchClient != client) {
-    fileDragStopRemoteWatch();
+    fileDragStopRemoteWatch("the cursor is on another computer");
   }
   if (sides == m_fileDragRemoteWatchSides) {
     return;
   }
-  if (sides != 0) {
-    LOG_INFO(
-        "file drag: held button near the edge of \"%s\", asking it to watch sides 0x%x for files",
-        getName(client).c_str(), sides
-    );
-  } else {
-    LOG_INFO("file drag: \"%s\" stops watching its edge", getName(client).c_str());
+  if (sides == 0) {
+    fileDragStopRemoteWatch(canWatch ? "the cursor moved away from the edge" : "watching no longer applies");
+    return;
   }
-  m_fileDragRemoteWatchClient = sides != 0 ? client : nullptr;
+  LOG_INFO(
+      "file drag: held button near the edge of \"%s\", asking it to watch sides 0x%x for files",
+      getName(client).c_str(), sides
+  );
+  m_fileDragRemoteWatchClient = client;
   m_fileDragRemoteWatchSides = sides;
   client->fileDragSend(Message::watch(sides));
 }

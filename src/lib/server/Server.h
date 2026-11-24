@@ -379,7 +379,7 @@ private:
   // server: m_fileDragSource is the client the files come from, the target is the server.
   void handleFileDragEvent(const Event &event);
   void fileDragUpdateRemoteWatch(int32_t x, int32_t y);
-  void fileDragStopRemoteWatch();
+  void fileDragStopRemoteWatch(const char *why);
   void fileDragRemoteOffer(BaseClientProxy *client, bool ready);
   bool fileDragFromClient(BaseClientProxy *client, const deskflow::filedrag::Message &message);
   bool fileDragFromLocalToClient(const deskflow::filedrag::Message &message);
